@@ -8,6 +8,9 @@
 #include <cstring>
 #include "soc/rtc_cntl_reg.h"
 #include "driver/rtc_io.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/periph_ctrl.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_heap_caps.h"
@@ -17,8 +20,7 @@
 #include "esp_mac.h"
 #include "mbedtls/sha256.h"
 #include <WiFi.h>
-#include <DFRobot_SHT3x.h>
-#include "DFRobot_GNSS.h"
+#include <cmath>
 #include <ArduinoJson.h>
 
 #define sensor_t camera_sensor_t
@@ -29,7 +31,9 @@
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "model-parameters/model_variables.h"
 
-#define VDD_POWER 13  // Camera power GPIO
+// Load switches (active high, keep ACTIVE for peripherals)
+#define LD_SWCH_1 13  // Camera + GNSS
+#define LD_SWCH_2 14  // OLED, MAX17048
 
 // Camera pins (DFR0975)
 #define PWDN_GPIO_NUM    -1
@@ -106,6 +110,16 @@ int topCropPercent = 40;
 #define DEFAULT_SLEEP_TIME 3600  // seconds
 RTC_DATA_ATTR int customSleepDuration = DEFAULT_SLEEP_TIME;
 
+// Operational window (local time). Active between WAKE and NAP; sleeps outside.
+// Handles midnight-spanning sleep windows (e.g. NAP 20:00 → WAKE 06:00).
+#define WAKE_HOUR   8
+#define WAKE_MINUTE 0
+#define NAP_HOUR   18
+#define NAP_MINUTE  0
+// Fallback TZ offset in quarter-hours from UTC, used when modem CCLK lacks a TZ suffix.
+// CET (UTC+1) = 4, CEST (UTC+2) = 8.
+#define FALLBACK_TZ_QUARTER_HOURS 0
+
 #define BC95_RX_PIN 44  // ESP32 RX connected to BC95 TX
 #define BC95_TX_PIN 43  // ESP32 TX connected to BC95 RX
 HardwareSerial bc95_modem(2);
@@ -113,12 +127,13 @@ static const char* SERVER_IP = "34.10.203.180";
 static const int TCP_PORT = 8009;
 static bool moduleInitialized = false;
 
-// TCP receive: wait for server response after sending data
+// TCP receive: optional wait for server response after sending data (AT+QIRD)
+#define TCP_WAIT_FOR_SERVER_RESPONSE 0  // 0 = one-way upload only; 1 = wait for server JSON/command
 #define TCP_RECV_TIMEOUT_MS 15000   // How long to wait for server response
 #define TCP_RECV_POLL_MS    1000    // Poll interval for AT+QIRD
 #define TCP_RECV_BUFFER_SIZE 512    // Max command size from server
 
-static bool usePSM = false;  // Set true to keep modem in PSM during sleep (VDD must stay HIGH)
+static bool usePSM = true;  // Keep modem in PSM during ESP deep sleep to minimize current (modem supply stays on)
 #define PSM_ACTIVE_TIME "00100001"   // 1 minute
 #define PSM_PERIODIC_TAU "00100001"  // 1 hour
 static bool useEDRX = true;
@@ -131,27 +146,36 @@ static char measurement_id[37] = {0};
 static int batteryPercentage = 0;
 static bool sensorDataValid = false;
 static struct { float temperature = 0.0f; float humidity = 0.0f; } sensorData;
-static bool gpsFixObtained = false;
-static bool gnssCoordinatesValid = false;
-static double gnssLatitude = 0.0;
-static double gnssLongitude = 0.0;
+// ---- Hardware variant switches (compile-time) ----
+#ifndef HAS_GNSS
+#define HAS_GNSS 0
+#endif
 
-static bool useGNSS = false;  // Enable GNSS module (GPS + GLONASS)
-DFRobot_GNSS_I2C gnss(&Wire, GNSS_DEVICE_ADDR);
+// GNSS (u-blox MAX-M10S) on I2C (DDC)
+#define GNSS_I2C_ADDR 0x42
 
-static bool useSHT30 = true;
+#ifndef GNSS_ACQUIRE_TIMEOUT_MS
+#define GNSS_ACQUIRE_TIMEOUT_MS 60000UL
+#endif
+
+struct GnssFix {
+  bool valid = false;
+  double lat_deg = 0.0;
+  double lon_deg = 0.0;
+  float speed_knots = 0.0f;
+  float course_deg = 0.0f;
+  float altitude_m = 0.0f;
+  int fix_quality = 0;
+  int sats_used = 0;
+  float hdop = 0.0f;
+  int utc_hh = -1, utc_mm = -1, utc_ss = -1;
+  int utc_DD = -1, utc_MM = -1, utc_YY = -1;
+};
+
+static GnssFix g_gnssLastFix;
+
 static bool useFuelGauge = true;
 #define MAX17048_I2C_ADDR 0x36
-static DFRobot_SHT3x sht30(&Wire, 0x45);
-
-// GNSS: timeout for fix acquisition and NVS fallback
-#define TIMEOUT_DURATION 120000   // ms (2 min) for getGNSS loop
-#define NVS_GNSS_NAMESPACE "gnss_pos"
-#define NVS_KEY_LAT "lat"
-#define NVS_KEY_LON "lon"
-#define NVS_KEY_TS "ts"
-#define GNSS_MAX_STALE_AGE_SEC (24 * 60 * 60)  // 24 hours
-static bool gnssPositionIsStale = false;
 
 #ifndef I2C_CLOCK_HZ
 #define I2C_CLOCK_HZ 100000UL
@@ -201,51 +225,9 @@ static void initI2CBusOnce(void) {
   Serial.println("I2C bus initialized");
 }
 
-// GNSS NVS: save/load last-known position for fallback
-static void saveGNSSToNVS(double lat, double lon) {
-  nvs_handle_t h;
-  esp_err_t err = nvs_open(NVS_GNSS_NAMESPACE, NVS_READWRITE, &h);
-  if (err != ESP_OK) {
-    Serial.printf("Failed to open GNSS NVS namespace: %s\n", esp_err_to_name(err));
-    return;
-  }
-  int64_t lat_int = (int64_t)(lat * 1e7);
-  int64_t lon_int = (int64_t)(lon * 1e7);
-  uint32_t timestamp = (uint32_t)(millis() / 1000);
-  nvs_set_i64(h, NVS_KEY_LAT, lat_int);
-  nvs_set_i64(h, NVS_KEY_LON, lon_int);
-  nvs_set_u32(h, NVS_KEY_TS, timestamp);
-  err = nvs_commit(h);
-  nvs_close(h);
-  if (err == ESP_OK) {
-    Serial.printf("Saved GNSS to NVS: %.6f, %.6f (ts=%u)\n", lat, lon, timestamp);
-  } else {
-    Serial.printf("Failed to commit GNSS to NVS: %s\n", esp_err_to_name(err));
-  }
-}
-
-static bool loadGNSSFromNVS(double& lat, double& lon, uint32_t& age_sec) {
-  nvs_handle_t h;
-  esp_err_t err = nvs_open(NVS_GNSS_NAMESPACE, NVS_READONLY, &h);
-  if (err != ESP_OK) return false;
-  int64_t lat_int = 0, lon_int = 0;
-  uint32_t saved_ts = 0;
-  err = nvs_get_i64(h, NVS_KEY_LAT, &lat_int);
-  if (err != ESP_OK) { nvs_close(h); return false; }
-  err = nvs_get_i64(h, NVS_KEY_LON, &lon_int);
-  if (err != ESP_OK) { nvs_close(h); return false; }
-  nvs_get_u32(h, NVS_KEY_TS, &saved_ts);
-  nvs_close(h);
-  lat = (double)lat_int / 1e7;
-  lon = (double)lon_int / 1e7;
-  uint32_t current_ts = (uint32_t)(millis() / 1000);
-  age_sec = (current_ts > saved_ts) ? (current_ts - saved_ts) : 0;
-  Serial.printf("Loaded GNSS from NVS: %.6f, %.6f (age ~%u s)\n", lat, lon, (unsigned)age_sec);
-  return true;
-}
 
 // OLED: SSD1315 compatible with SSD1306 driver, 128x64, HW I2C
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 
 static bool showOLED = true;
 
@@ -372,50 +354,212 @@ static void oled_splash(void) {
   u8g2.sendBuffer();
 }
 
-static void getGNSS(void) {
-  unsigned long startTime = millis();
-  gnssPositionIsStale = false;
-  while (millis() - startTime < (unsigned long)TIMEOUT_DURATION) {
-    if (isCycleTimeoutExceeded()) {
-      Serial.println("GNSS: Global cycle timeout, aborting");
-      break;
+// ---- GNSS (u-blox MAX-M10S via DDC/I2C) ----
+
+static bool nmeaChecksumOK(const String& line) {
+  int star = line.indexOf('*');
+  if (star < 0) return true;
+  if (star + 2 >= (int)line.length()) return false;
+  uint8_t calc = 0;
+  int start = (line.length() > 0 && line[0] == '$') ? 1 : 0;
+  for (int i = start; i < star; i++) calc ^= (uint8_t)line[i];
+  char h1 = line[star + 1];
+  char h2 = line[star + 2];
+  auto hexVal = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+  };
+  int v1 = hexVal(h1), v2 = hexVal(h2);
+  if (v1 < 0 || v2 < 0) return false;
+  uint8_t got = (uint8_t)((v1 << 4) | v2);
+  return got == calc;
+}
+
+static double nmeaDegMinToDecimal(const String& ddmm, const String& hemi) {
+  if (ddmm.length() < 4) return 0.0;
+  int dot = ddmm.indexOf('.');
+  int minStart = (dot == -1) ? (ddmm.length() - 2) : (dot - 2);
+  if (minStart <= 0) return 0.0;
+  double deg = ddmm.substring(0, minStart).toDouble();
+  double minutes = ddmm.substring(minStart).toDouble();
+  double dec = deg + minutes / 60.0;
+  if (hemi == "S" || hemi == "W") dec = -dec;
+  return dec;
+}
+
+static bool splitNmeaCSV(const String& body, String* out, int maxFields, int& outCount) {
+  outCount = 0;
+  int start = 0;
+  while (outCount < maxFields) {
+    int comma = body.indexOf(',', start);
+    if (comma == -1) {
+      out[outCount++] = body.substring(start);
+      return true;
     }
-    uint8_t numSatellites = gnss.getNumSatUsed();
-    if (numSatellites > 0) {
-      sLonLat_t lat = gnss.getLat();
-      sLonLat_t lon = gnss.getLon();
-      oled_status("GNSS", "fix OK", -1);
-      gnssLatitude = lat.latitudeDegree;
-      if ((char)lat.latDirection == 'S') gnssLatitude = -gnssLatitude;
-      gnssLongitude = lon.lonitudeDegree;
-      if ((char)lon.lonDirection == 'W') gnssLongitude = -gnssLongitude;
-      gnssCoordinatesValid = true;
-      gnssPositionIsStale = false;
-      gpsFixObtained = true;
-      saveGNSSToNVS(gnssLatitude, gnssLongitude);
-      return;
+    out[outCount++] = body.substring(start, comma);
+    start = comma + 1;
+  }
+  return true;
+}
+
+static void gnssApplyRMC(const String& body, GnssFix& fix) {
+  String f[16];
+  int n = 0;
+  splitNmeaCSV(body, f, 16, n);
+  if (n < 10) return;
+  const String& t = f[1];
+  const String& status = f[2];
+  const String& lat = f[3];
+  const String& latH = f[4];
+  const String& lon = f[5];
+  const String& lonH = f[6];
+  const String& spd = f[7];
+  const String& crs = f[8];
+  const String& date = f[9];
+
+  if (t.length() >= 6) {
+    fix.utc_hh = t.substring(0, 2).toInt();
+    fix.utc_mm = t.substring(2, 4).toInt();
+    fix.utc_ss = t.substring(4, 6).toInt();
+  }
+  if (date.length() >= 6) {
+    fix.utc_DD = date.substring(0, 2).toInt();
+    fix.utc_MM = date.substring(2, 4).toInt();
+    fix.utc_YY = date.substring(4, 6).toInt();
+  }
+
+  if (status == "A") {
+    if (lat.length() > 0 && lon.length() > 0) {
+      fix.lat_deg = nmeaDegMinToDecimal(lat, latH);
+      fix.lon_deg = nmeaDegMinToDecimal(lon, lonH);
     }
-    delay(5000);
-    char elapsed[16];
-    snprintf(elapsed, sizeof(elapsed), "%lu s", (unsigned long)((millis() - startTime) / 1000));
-    oled_status("GNSS time", elapsed, -1);
+    fix.speed_knots = spd.toFloat();
+    fix.course_deg = crs.toFloat();
+    if (std::fabs(fix.lat_deg) > 0.001 || std::fabs(fix.lon_deg) > 0.001) fix.valid = true;
   }
-  Serial.println("GNSS timeout - attempting NVS fallback...");
-  double fallbackLat, fallbackLon;
-  uint32_t age_sec;
-  if (loadGNSSFromNVS(fallbackLat, fallbackLon, age_sec) && age_sec < GNSS_MAX_STALE_AGE_SEC) {
-    gnssLatitude = fallbackLat;
-    gnssLongitude = fallbackLon;
-    gnssCoordinatesValid = true;
-    gnssPositionIsStale = true;
-    gpsFixObtained = false;
-    oled_status("GNSS", "NVS fallback", -1);
-    return;
+}
+
+static void gnssApplyGGA(const String& body, GnssFix& fix) {
+  String f[20];
+  int n = 0;
+  splitNmeaCSV(body, f, 20, n);
+  if (n < 10) return;
+  const String& lat = f[2];
+  const String& latH = f[3];
+  const String& lon = f[4];
+  const String& lonH = f[5];
+  fix.fix_quality = f[6].toInt();
+  fix.sats_used = f[7].toInt();
+  fix.hdop = f[8].toFloat();
+  fix.altitude_m = f[9].toFloat();
+
+  if (fix.fix_quality > 0) {
+    if (lat.length() > 0 && lon.length() > 0) {
+      fix.lat_deg = nmeaDegMinToDecimal(lat, latH);
+      fix.lon_deg = nmeaDegMinToDecimal(lon, lonH);
+    }
+    if (std::fabs(fix.lat_deg) > 0.001 || std::fabs(fix.lon_deg) > 0.001) fix.valid = true;
   }
-  oled_status("GNSS", "timeout no fix", -1);
-  gpsFixObtained = false;
-  gnssCoordinatesValid = false;
-  gnssPositionIsStale = false;
+}
+
+static size_t gnssDdcReadPayload(uint8_t* out, size_t outMax, uint16_t* availOut = nullptr) {
+  if (outMax == 0) return 0;
+  size_t req = 2 + outMax;
+  if (req > 255) req = 255;
+
+  int n = Wire.requestFrom((uint8_t)GNSS_I2C_ADDR, (uint8_t)req, (uint8_t)true);
+  if (n < 2) return 0;
+
+  uint8_t msb = (uint8_t)Wire.read();
+  uint8_t lsb = (uint8_t)Wire.read();
+  uint16_t avail = (uint16_t)((msb << 8) | lsb);
+  if (availOut) *availOut = avail;
+
+  size_t toCopy = min((size_t)avail, outMax);
+  size_t got = 0;
+  while (Wire.available() && got < toCopy) {
+    out[got++] = (uint8_t)Wire.read();
+  }
+  while (Wire.available()) (void)Wire.read();
+
+  return got;
+}
+
+static bool gnssReadLatestFixSinceWake(GnssFix& outFix, unsigned long timeoutMs) {
+  outFix = GnssFix{};
+
+  Wire.beginTransmission(GNSS_I2C_ADDR);
+  if (Wire.endTransmission(true) != 0) {
+    Serial.println("[GNSS] No ACK on I2C (0x42)");
+    return false;
+  }
+
+  delay(50);
+
+  unsigned long flushStart = millis();
+  while (millis() - flushStart < 150) {
+    uint16_t avail = 0;
+    uint8_t dump[64];
+    size_t got = gnssDdcReadPayload(dump, sizeof(dump), &avail);
+    if (avail == 0 || got == 0) break;
+    delay(5);
+  }
+
+  String lineBuf;
+  lineBuf.reserve(160);
+
+  bool sawRmcA = false;
+  bool sawGgaFix = false;
+
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    uint16_t avail = 0;
+    uint8_t chunk[96];
+    size_t got = gnssDdcReadPayload(chunk, sizeof(chunk), &avail);
+    if (avail == 0 || got == 0) {
+      delay(20);
+      continue;
+    }
+
+    for (size_t i = 0; i < got; i++) {
+      char c = (char)chunk[i];
+      if (c == '\r') continue;
+      if (c == '\n') {
+        String line = lineBuf;
+        lineBuf = "";
+        line.trim();
+        if (line.length() == 0) continue;
+        if (line[0] != '$') continue;
+        if (!nmeaChecksumOK(line)) continue;
+
+        int star = line.indexOf('*');
+        String noCk = (star >= 0) ? line.substring(1, star) : line.substring(1);
+
+        int comma = noCk.indexOf(',');
+        if (comma < 0) continue;
+        String type = noCk.substring(0, comma);
+        String body = noCk;
+
+        if (type.endsWith("RMC")) {
+          gnssApplyRMC(body, outFix);
+          if (outFix.valid) sawRmcA = true;
+        } else if (type.endsWith("GGA")) {
+          gnssApplyGGA(body, outFix);
+          if (outFix.fix_quality > 0) sawGgaFix = true;
+        }
+
+        if (sawRmcA && sawGgaFix && outFix.valid) {
+          return true;
+        }
+      } else {
+        if (lineBuf.length() < 200) lineBuf += c;
+      }
+    }
+  }
+
+  return outFix.valid;
 }
 
 // Mutex so Serial output is not interleaved (Serial is not thread-safe)
@@ -423,6 +567,40 @@ static SemaphoreHandle_t s_serialMutex = NULL;
 
 static camera_config_t s_camera_config;
 static bool s_camera_initialised = false;
+
+static void forceStopXclk(void) {
+  // Best-effort: stop XCLK generation so the camera can't be partially back-powered
+  // through the XCLK pin when its rail is turned off.
+  // ledc_stop() can log "LEDC is not initialized" if the driver wasn't active; ignore.
+  ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+  ledcDetachPin(XCLK_GPIO_NUM);
+  pinMode(XCLK_GPIO_NUM, OUTPUT);
+  digitalWrite(XCLK_GPIO_NUM, LOW);
+  delayMicroseconds(50);
+  pinMode(XCLK_GPIO_NUM, INPUT);
+}
+
+static void forceStartXclk(uint32_t freq_hz = 20000000) {
+  // Some camera modules won't ACK SCCB/I2C unless XCLK is running.
+  // Starting XCLK explicitly makes wake-from-deep-sleep far more reliable.
+  ledc_timer_config_t timer_conf = {};
+  timer_conf.speed_mode = LEDC_LOW_SPEED_MODE;
+  timer_conf.duty_resolution = LEDC_TIMER_1_BIT; // 1-bit => 50% duty
+  timer_conf.timer_num = LEDC_TIMER_0;
+  timer_conf.freq_hz = freq_hz;
+  timer_conf.clk_cfg = LEDC_AUTO_CLK;
+  (void)ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t ch_conf = {};
+  ch_conf.speed_mode = LEDC_LOW_SPEED_MODE;
+  ch_conf.channel = LEDC_CHANNEL_0;
+  ch_conf.timer_sel = LEDC_TIMER_0;
+  ch_conf.intr_type = LEDC_INTR_DISABLE;
+  ch_conf.gpio_num = XCLK_GPIO_NUM;
+  ch_conf.duty = 1; // 50%
+  ch_conf.hpoint = 0;
+  (void)ledc_channel_config(&ch_conf);
+}
 
 // Phase 1b: camera init with warm-up (no EI, no lib/deploy)
 static bool camera_init(void) {
@@ -462,6 +640,42 @@ static bool camera_init(void) {
     s_camera_config.jpeg_quality = 12;
     s_camera_config.fb_count = 1;
   }
+
+  // Reset LEDC to ensure a clean XCLK start after deep sleep.
+  periph_module_reset(PERIPH_LEDC_MODULE);
+
+  // Start XCLK *before* SCCB probing / esp_camera_init.
+  // Many OV sensors need the clock running to respond on SCCB.
+  forceStartXclk((uint32_t)s_camera_config.xclk_freq_hz);
+  delay(5);
+
+  // Ensure SCCB/I2C bus is in a sane state before probing the sensor.
+  // After deep sleep wakeups the shared I2C bus can be left mid-transaction.
+  i2cBusRecover();
+
+  // #region agent log — I2C scan before esp_camera_init
+  {
+    Wire.end();
+    delay(5);
+    pinMode(SIOD_GPIO_NUM, INPUT_PULLUP);
+    pinMode(SIOC_GPIO_NUM, INPUT_PULLUP);
+    delay(2);
+    Wire.begin(SIOD_GPIO_NUM, SIOC_GPIO_NUM);
+    Wire.setClock(100000);
+    Wire.setTimeOut(50);
+    Serial.printf("[DBG-59d7ad] I2C scan SDA=%d SCL=%d: ",
+                  digitalRead(SIOD_GPIO_NUM), digitalRead(SIOC_GPIO_NUM));
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+      Wire.beginTransmission(addr);
+      uint8_t e = Wire.endTransmission(true);
+      if (e == 0) Serial.printf("0x%02X(ACK) ", addr);
+      else if (addr == 0x30) Serial.printf("0x30(err=%u) ", e);
+    }
+    Serial.println();
+    Wire.end();
+    delay(2);
+  }
+  // #endregion
 
   Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&s_camera_config);
@@ -537,6 +751,11 @@ static bool camera_init(void) {
   }
 
   Serial.printf("Warm-up done: %d/%d frames in %lums\n", successfulFrames, WARMUP_TARGET_FRAMES, millis() - warmupStart);
+  if (!warmupSuccess) {
+    s_camera_initialised = false;
+    is_initialised = false;
+    return false;
+  }
   s_camera_initialised = true;
   is_initialised = true;
   return true;
@@ -646,11 +865,20 @@ static int get_signal_data_785971(size_t offset, size_t length, float* out_ptr) 
 
 // Phase 2b: camera deinit (called from enterSleepMode)
 void ei_camera_deinit(void) {
+  if (!s_camera_initialised && !is_initialised) {
+    return;  // avoid deinit warnings when camera never fully came up
+  }
+
+  // Stop XCLK first to avoid keeping the sensor partially alive via the clock pin.
+  forceStopXclk();
+
+  // Best-effort: deinit camera driver. Some Arduino/esp32-camera builds emit a gdma_disconnect warning
+  // if the peripheral channel is already disconnected; it's usually harmless.
   esp_err_t err = esp_camera_deinit();
   if (err != ESP_OK) {
-    ei_printf("Camera deinit failed\n");
-    return;
+    ei_printf("Camera deinit failed (0x%x)\n", err);
   }
+
   is_initialised = false;
   s_camera_initialised = false;
 }
@@ -658,6 +886,53 @@ void ei_camera_deinit(void) {
 static void configurePSM(void);
 static void prepareModuleForPSM(void);
 static void wakeModuleFromPSM(void);
+
+static void highz_no_pulls(int g) {
+  if (g < 0) return;
+  pinMode(g, INPUT);
+  gpio_pullup_dis((gpio_num_t)g);
+  gpio_pulldown_dis((gpio_num_t)g);
+}
+
+static void stopI2CAndSleepOled(void) {
+  // Best-effort: put OLED into low-power mode before cutting its rail
+  u8g2.setPowerSave(1);
+
+  // Stop I2C peripheral; prevents it from keeping pins/peripheral active
+  Wire.end();
+
+  // Make bus pins high-Z (note: external pull-ups to 3V3 can still back-power
+  // unpowered peripherals; hardware fix is pull-ups to switched rail or bus isolation)
+  highz_no_pulls(SIOD_GPIO_NUM);
+  highz_no_pulls(SIOC_GPIO_NUM);
+}
+
+static void prepareVddDomainPinsForSleep(void) {
+  // Pins connected to peripherals powered by LD_SWCH_1/LD_SWCH_2 should not be driving
+  // when the load switches are turned off. Put them in high-Z with no pulls.
+  const int vddPins[] = {
+      // Camera SCCB/I2C
+      SIOD_GPIO_NUM,
+      SIOC_GPIO_NUM,
+      // Camera timing
+      VSYNC_GPIO_NUM,
+      HREF_GPIO_NUM,
+      XCLK_GPIO_NUM,
+      PCLK_GPIO_NUM,
+      // Camera data bus
+      Y2_GPIO_NUM,
+      Y3_GPIO_NUM,
+      Y4_GPIO_NUM,
+      Y5_GPIO_NUM,
+      Y6_GPIO_NUM,
+      Y7_GPIO_NUM,
+      Y8_GPIO_NUM,
+      Y9_GPIO_NUM,
+  };
+  for (size_t i = 0; i < sizeof(vddPins) / sizeof(vddPins[0]); i++) {
+    highz_no_pulls(vddPins[i]);
+  }
+}
 
 // Phase 2b: full enterSleepMode (PSM optional; timer + VDD off)
 static void enterSleepMode(void) {
@@ -675,30 +950,86 @@ static void enterSleepMode(void) {
   btStop();
 
   // 2) Deinit camera
-  Serial.println("Deinitializing camera...");
-  ei_camera_deinit();
-  delay(100);
+  if (s_camera_initialised || is_initialised) {
+    Serial.println("Deinitializing camera...");
+    ei_camera_deinit();
+    delay(100);
+  }
 
   // 3) Sleep timer
   esp_sleep_enable_timer_wakeup((uint64_t)customSleepDuration * uS_TO_S_FACTOR);
   Serial.printf("Setup ESP32 to sleep for %d seconds\n", customSleepDuration);
 
-  // 4) OLED sleep message
+  // 4) OLED sleep message (while still powered)
   char sleepMsg[24];
   snprintf(sleepMsg, sizeof(sleepMsg), "Sleep %ds", customSleepDuration);
   oled_status("SLEEPING...", sleepMsg, -1);
 
-  // 5) VDD_POWER off (camera and peripherals)
-  Serial.println("Turning VDD_POWER OFF");
-  digitalWrite(VDD_POWER, LOW);
-  rtc_gpio_hold_en((gpio_num_t)VDD_POWER);
+  // 5) Put OLED to sleep + stop I2C before powering down its rail
+  stopI2CAndSleepOled();
 
-  // 6) Free classification photo
+  // 6) Ensure all LD_SWCH-domain pins are benign before cutting power.
+  //    Drive SDA, SCL, and XCLK LOW (not just Hi-Z) to sink any external pull-up
+  //    current and prevent back-feeding the camera through I/O protection diodes.
+  prepareVddDomainPinsForSleep();
+  // Override SDA/SCL/XCLK: drive LOW to counteract external pull-ups
+  pinMode(SIOD_GPIO_NUM, OUTPUT); digitalWrite(SIOD_GPIO_NUM, LOW);
+  pinMode(SIOC_GPIO_NUM, OUTPUT); digitalWrite(SIOC_GPIO_NUM, LOW);
+  pinMode(XCLK_GPIO_NUM, OUTPUT); digitalWrite(XCLK_GPIO_NUM, LOW);
+  highz_no_pulls(BC95_RX_PIN);
+  highz_no_pulls(BC95_TX_PIN);
+
+  // 7) Power down switchable peripherals before deep sleep
+  // LD_SWCH_1: camera + GNSS
+  // LD_SWCH_2: OLED, MAX17048
+  Serial.println("Turning load switches OFF");
+  digitalWrite(LD_SWCH_1, LOW);
+  digitalWrite(LD_SWCH_2, LOW);
+
+  // IMPORTANT (deep sleep): keep load switches latched OFF and SDA/SCL/XCLK
+  // driven LOW while sleeping. This prevents:
+  // 1. Load switch pins floating HIGH → partial camera power
+  // 2. External I2C pull-ups back-feeding camera through SDA/SCL I/O diodes
+  const int pinsToHoldLow[] = {LD_SWCH_1, LD_SWCH_2,
+                               SIOD_GPIO_NUM, SIOC_GPIO_NUM, XCLK_GPIO_NUM};
+  for (size_t i = 0; i < sizeof(pinsToHoldLow) / sizeof(pinsToHoldLow[0]); i++) {
+    int g = pinsToHoldLow[i];
+    if (g < 0) continue;
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)g)) {
+      rtc_gpio_hold_en((gpio_num_t)g);
+    } else {
+      gpio_hold_en((gpio_num_t)g);
+    }
+  }
+  gpio_deep_sleep_hold_en();
+
+  // 8) Free classification photo
   if (classificationPhoto != nullptr) {
     heap_caps_free(classificationPhoto);
     classificationPhoto = nullptr;
     classificationPhotoSize = 0;
     Serial.println("Cleaned up classification photo");
+  }
+
+  // 9) Power-saving:
+  // Keep RTC peripherals ON so RTC GPIO hold (load switch pins) remains effective.
+  // This costs a bit of sleep current but prevents peripherals from being partially powered.
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
+
+  // 10) Optional: isolate GPIOs to prevent leakage (RTC IOs only)
+  // Note: rtc_gpio_isolate() only works on RTC-capable IOs. On ESP32-S3 many GPIOs are NOT RTC IOs.
+  // Calling it on non-RTC pins spams logs: "RTCIO number error".
+  const int gpiosToIsolate[] = {SIOD_GPIO_NUM, SIOC_GPIO_NUM, VSYNC_GPIO_NUM, HREF_GPIO_NUM,
+                                XCLK_GPIO_NUM, PCLK_GPIO_NUM, Y2_GPIO_NUM, Y3_GPIO_NUM,
+                                Y4_GPIO_NUM, Y5_GPIO_NUM, Y6_GPIO_NUM, Y7_GPIO_NUM,
+                                Y8_GPIO_NUM, Y9_GPIO_NUM, BC95_RX_PIN, BC95_TX_PIN};
+  for (size_t i = 0; i < sizeof(gpiosToIsolate) / sizeof(gpiosToIsolate[0]); i++) {
+    int g = gpiosToIsolate[i];
+    if (g < 0) continue;
+    if (!rtc_gpio_is_valid_gpio((gpio_num_t)g)) continue;
+    rtc_gpio_isolate((gpio_num_t)g);
   }
 
   delay(100);
@@ -801,6 +1132,80 @@ static void updateOledSignalFromCSQ(void) {
     }
   }
 }
+
+// ---- Operational-window time helpers ----
+
+struct NetworkTime {
+  int year, month, day;
+  int hour, minute, second;
+  int tzQuarterHours;
+  bool hasTz;
+  bool valid;
+};
+
+/** Parse full date/time/TZ from the quoted CCLK payload "YY/MM/DD,HH:MM:SS±ZZ". */
+static bool parseNetworkTimeFull(const String& payload, NetworkTime& nt) {
+  nt = {};
+  String s = payload;
+  s.trim();
+  if (s.startsWith("\"")) s = s.substring(1);
+  if (s.endsWith("\""))   s = s.substring(0, s.length() - 1);
+  if (s.length() < 17) return false;
+
+  nt.year   = s.substring(0, 2).toInt();
+  nt.month  = s.substring(3, 5).toInt();
+  nt.day    = s.substring(6, 8).toInt();
+  nt.hour   = s.substring(9, 11).toInt();
+  nt.minute = s.substring(12, 14).toInt();
+  nt.second = s.substring(15, 17).toInt();
+
+  if (s.length() >= 20) {
+    char sign = s.charAt(17);
+    if (sign == '+' || sign == '-') {
+      int tzVal = s.substring(18, 20).toInt();
+      nt.tzQuarterHours = (sign == '-') ? -tzVal : tzVal;
+      nt.hasTz = true;
+    }
+  }
+
+  if (nt.year < 24 || nt.month < 1 || nt.month > 12 ||
+      nt.day < 1 || nt.day > 31 || nt.hour > 23 || nt.minute > 59) {
+    return false;
+  }
+  nt.valid = true;
+  return true;
+}
+
+/** Convert NetworkTime to local second-of-day (0..86399). */
+static int resolveLocalSecondOfDay(const NetworkTime& nt) {
+  int sec = nt.hour * 3600 + nt.minute * 60 + nt.second;
+  if (!nt.hasTz) {
+    sec += FALLBACK_TZ_QUARTER_HOURS * 900;
+    sec %= 86400;
+    if (sec < 0) sec += 86400;
+  }
+  return sec;
+}
+
+/** True when localSecOfDay falls inside the WAKE→NAP active window. */
+static bool isInsideOperationalWindow(int localSecOfDay) {
+  const int wakeSec = WAKE_HOUR * 3600 + WAKE_MINUTE * 60;
+  const int napSec  = NAP_HOUR  * 3600 + NAP_MINUTE  * 60;
+  if (wakeSec == napSec) return true;
+  if (wakeSec < napSec)
+    return (localSecOfDay >= wakeSec && localSecOfDay < napSec);
+  return (localSecOfDay >= wakeSec || localSecOfDay < napSec);
+}
+
+/** Seconds from localSecOfDay until the next WAKE boundary. */
+static int secondsUntilNextWake(int localSecOfDay) {
+  const int wakeSec = WAKE_HOUR * 3600 + WAKE_MINUTE * 60;
+  if (localSecOfDay < wakeSec)
+    return wakeSec - localSecOfDay;
+  return 86400 - localSecOfDay + wakeSec;
+}
+
+// ---- Legacy HH:MM-only parser (still used for OLED display) ----
 
 /** Parse network time from AT+CCLK response. Expected: "25/06/08,07:29:51+08" (quoted). */
 static bool parseNetworkTime(const String& timeResponse, int& hour, int& minute) {
@@ -974,8 +1379,8 @@ static void initializeModule(void) {
   Serial.println("Rebooting module...");
   oled_status("module reboot", "wait", -1);
   sendATCommand("AT&F0", 1000);
-  Serial.println("Configuring APN (iot.1nce.net)...");
-  sendATCommand("AT+QCGDEFCONT=\"IP\",\"iot.1nce.net\"", 2000);
+  Serial.println("Configuring APN (sensor.net)..."); //simky od Honzy sensor.net; moje simky iot.1nce.net
+  sendATCommand("AT+QCGDEFCONT=\"IP\",\"sensor.net\"", 2000);
   sendATCommand("AT+NRB", 1000);
   Serial.println("Waiting for module reboot...");
   delay(4000);
@@ -985,6 +1390,17 @@ static void initializeModule(void) {
   Serial.println("Setting CFUN=1...");
   oled_status("set CFUN", "1", -1);
   sendATCommand("AT+CFUN=1", 3000);
+  String cgsnResp = sendATCommand("AT+CGSN=1", 1000);
+  int cgsnPos = cgsnResp.indexOf("+CGSN:");
+  if (cgsnPos != -1) {
+    int start = cgsnPos + 6;
+    int end = cgsnResp.indexOf('\r', start);
+    if (end == -1) end = cgsnResp.indexOf('\n', start);
+    if (end == -1) end = cgsnResp.length();
+    String imei = cgsnResp.substring(start, end);
+    imei.trim();
+    Serial.println("IMEI: " + imei);
+  }
   Serial.println("Waiting for SIM (CPIN)...");
   oled_status("SIM wait", "CPIN", -1);
   bool simReady = false;
@@ -1045,7 +1461,7 @@ static void initializeModule(void) {
   Serial.printf("Module init complete. Status: %s\n", moduleInitialized ? "OK" : "Failed");
 }
 
-// Phase 2b: optional sensors (SHT30, MAX17048)
+// Phase 2b: optional sensors (MAX17048)
 static bool initializeMAX17048(void) {
   Wire.beginTransmission(MAX17048_I2C_ADDR);
   if (Wire.endTransmission() != 0) return false;
@@ -1084,21 +1500,6 @@ static void readBatteryStatus(void) {
   }
   oledStatus.batteryPercent = batteryPercentage;
 }
-static void readSHT30Sensor(void) {
-  if (!useSHT30) return;
-  float t = sht30.getTemperatureC();
-  float h = sht30.getHumidityRH();
-  if (isnan(t) || isnan(h)) {
-    sensorDataValid = false;
-    return;
-  }
-  if (h < 0.0f) h = 0.0f;
-  if (h > 100.0f) h = 100.0f;
-  sensorData.temperature = t;
-  sensorData.humidity = h;
-  sensorDataValid = true;
-}
-
 // Phase 2b: OLED transmit status (legacy name)
 static void oled_layout_transmit(const char* status) {
   oled_status(status, "", -1);
@@ -1201,12 +1602,28 @@ static String buildLineProtocolASCII(void) {
   String lineProtocol;
   lineProtocol.reserve(200);
   lineProtocol = "gps_data,device=esp32 ";
-  lineProtocol += "fix=" + String(gpsFixObtained ? 1 : 0) + ",";
   lineProtocol += "temp=" + String(sensorDataValid ? sensorData.temperature : NAN, 1) + ",";
   lineProtocol += "hum=" + String(sensorDataValid ? sensorData.humidity : NAN, 1) + ",";
-  lineProtocol += "lat=" + String(gnssCoordinatesValid ? gnssLatitude : NAN, 6) + ",";
-  lineProtocol += "lon=" + String(gnssCoordinatesValid ? gnssLongitude : NAN, 6) + ",";
   lineProtocol += "bat=" + String(batteryPercentage) + ",";
+  // GNSS fields
+  lineProtocol += "gnss_valid=" + String(g_gnssLastFix.valid ? 1 : 0) + ",";
+  if (g_gnssLastFix.valid) {
+    lineProtocol += "gnss_lat=" + String(g_gnssLastFix.lat_deg, 7) + ",";
+    lineProtocol += "gnss_lon=" + String(g_gnssLastFix.lon_deg, 7) + ",";
+    lineProtocol += "gnss_alt_m=" + String(g_gnssLastFix.altitude_m, 2) + ",";
+    lineProtocol += "gnss_sats=" + String(g_gnssLastFix.sats_used) + ",";
+    lineProtocol += "gnss_hdop=" + String(g_gnssLastFix.hdop, 2) + ",";
+    lineProtocol += "gnss_spd_kn=" + String(g_gnssLastFix.speed_knots, 2) + ",";
+    lineProtocol += "gnss_course=" + String(g_gnssLastFix.course_deg, 1) + ",";
+  } else {
+    lineProtocol += "gnss_lat=999,";
+    lineProtocol += "gnss_lon=999,";
+    lineProtocol += "gnss_alt_m=999,";
+    lineProtocol += "gnss_sats=0,";
+    lineProtocol += "gnss_hdop=999,";
+    lineProtocol += "gnss_spd_kn=0,";
+    lineProtocol += "gnss_course=0,";
+  }
   lineProtocol += "fill=" + String(fillLevel) + ",";
   lineProtocol += "mat=\"" + detectedMaterial + "\",";
   lineProtocol += "lvl_conf=" + String(levelConfidence, 3) + ",";
@@ -1318,6 +1735,7 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
   String lineProtocolASCII = buildLineProtocolASCII();
   String lineProtocolHex = asciiToHex(lineProtocolASCII);
   String header = "CORRELATION_HEADER\n";
+  header += "app:container-classifier\n";
   header += "device_id:" + String((unsigned long long)device_id, HEX) + "\n";
   header += "measurement_id:" + String(measurement_id) + "\n";
   header += "timestamp:" + String(millis()) + "\n";
@@ -1388,6 +1806,7 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
   waitForSendResult(10000, endResponse);
   delay(2000);
 
+#if TCP_WAIT_FOR_SERVER_RESPONSE
   // Wait for server response (bidirectional communication)
   oled_status("Waiting for", "server...", -1);
   String serverResponse;
@@ -1399,6 +1818,9 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
     oled_status("No server", "response", -1);
     delay(1000);
   }
+#else
+  Serial.println("TCP: skip wait for server response (TCP_WAIT_FOR_SERVER_RESPONSE=0)");
+#endif
 
   oled_status(imageInfoStr, "Closing", 98);
   sendATCommand("AT+QICLOSE=" + String(connectID), 3000);
@@ -1413,12 +1835,30 @@ static void runMainJob(void) {
     enterSleepMode();
     return;
   }
-  readSHT30Sensor();
   readBatteryStatus();
   Serial.println("Starting main job - BC95 modem already initialized.");
   initializeModule();
 
-  if (useGNSS) getGNSS();
+#if HAS_GNSS
+  oled_status("GNSS...", "acquire", 0);
+  {
+    GnssFix fix;
+    bool gotFix = gnssReadLatestFixSinceWake(fix, GNSS_ACQUIRE_TIMEOUT_MS);
+    g_gnssLastFix = fix;
+    if (gotFix) {
+      Serial.printf("[GNSS] Fix: lat=%.7f lon=%.7f alt=%.2fm sats=%d hdop=%.2f\n",
+                    g_gnssLastFix.lat_deg, g_gnssLastFix.lon_deg, g_gnssLastFix.altitude_m,
+                    g_gnssLastFix.sats_used, g_gnssLastFix.hdop);
+      oled_status("GNSS", "OK", 5);
+    } else {
+      Serial.println("[GNSS] No valid fix within timeout");
+      oled_status("GNSS", "NO FIX", 5);
+    }
+  }
+#else
+  g_gnssLastFix = GnssFix{};
+  Serial.println("[GNSS] Disabled (HW variant)");
+#endif
 
   updateOledSignalFromCSQ();
   int netHour = -1, netMin = -1;
@@ -1570,15 +2010,143 @@ static void appTask(void* pvParameters) {
   }
 }
 
+static void deIsolatePeripheralPinsOnWake(void) {
+  // Undo RTC isolation set before deep sleep.  Do NOT call gpio_reset_pin() here:
+  // that would re-enable default internal pull-ups while the camera rail (LD_SWCH_1)
+  // is still OFF, back-feeding the camera through I/O protection diodes and leaving
+  // it latched in an undefined state.  After this function, all pins are de-isolated
+  // but still Hi-Z; caller must set them explicitly before powering the rail.
+  const int pins[] = {
+      SIOD_GPIO_NUM, SIOC_GPIO_NUM,
+      VSYNC_GPIO_NUM, HREF_GPIO_NUM, XCLK_GPIO_NUM, PCLK_GPIO_NUM,
+      Y2_GPIO_NUM, Y3_GPIO_NUM, Y4_GPIO_NUM, Y5_GPIO_NUM,
+      Y6_GPIO_NUM, Y7_GPIO_NUM, Y8_GPIO_NUM, Y9_GPIO_NUM,
+      BC95_RX_PIN, BC95_TX_PIN,
+  };
+
+  for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+    int g = pins[i];
+    if (g < 0) continue;
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)g)) {
+      rtc_gpio_deinit((gpio_num_t)g);
+    }
+  }
+}
+
 void setup() {
-  // Phase 1a: DFR0975 order — brownout off, camera power, then Serial
+  // Phase 1a: DFR0975 order — brownout off, load switches on, then Serial
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-  rtc_gpio_hold_dis((gpio_num_t)VDD_POWER);
-  pinMode(VDD_POWER, OUTPUT);
-  digitalWrite(VDD_POWER, HIGH);
+  // Release all GPIO holds set before deep sleep (load switches + anti-backfeed pins).
+  gpio_deep_sleep_hold_dis();
+  const int heldPins[] = {LD_SWCH_1, LD_SWCH_2,
+                          SIOD_GPIO_NUM, SIOC_GPIO_NUM, XCLK_GPIO_NUM};
+  for (size_t i = 0; i < sizeof(heldPins) / sizeof(heldPins[0]); i++) {
+    int g = heldPins[i];
+    if (g < 0) continue;
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)g)) {
+      rtc_gpio_hold_dis((gpio_num_t)g);
+      rtc_gpio_deinit((gpio_num_t)g);
+    } else {
+      gpio_hold_dis((gpio_num_t)g);
+    }
+  }
 
-  delay(300);
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  bool fromDeepSleep = (wakeupCause == ESP_SLEEP_WAKEUP_TIMER ||
+                        wakeupCause == ESP_SLEEP_WAKEUP_EXT0 ||
+                        wakeupCause == ESP_SLEEP_WAKEUP_EXT1);
+
+  // #region agent log — debug wake sequence
+  Serial.begin(115200); delay(50);
+  // Read LD_SWCH_1 state BEFORE we touch it — tells us if hold kept it LOW during sleep
+  int ldswch1_raw = digitalRead(LD_SWCH_1);
+  Serial.printf("[DBG-59d7ad] wake=%d fromDeepSleep=%d LD_SWCH_1_raw=%d\n",
+                (int)wakeupCause, fromDeepSleep, ldswch1_raw);
+  // #endregion
+
+  // Step 1: Undo RTC isolation (no pull-ups yet — rail is still off).
+  if (fromDeepSleep) {
+    deIsolatePeripheralPinsOnWake();
+    // #region agent log
+    Serial.println("[DBG-59d7ad] RTC de-isolated, pins still Hi-Z");
+    // #endregion
+  }
+
+  // Step 2: All camera/I2C pins to Hi-Z with no pulls BEFORE powering the rail.
+  // This prevents back-feeding the unpowered camera through internal pull-ups.
+  prepareVddDomainPinsForSleep();
+  highz_no_pulls(SIOD_GPIO_NUM);
+  highz_no_pulls(SIOC_GPIO_NUM);
+  highz_no_pulls(BC95_RX_PIN);
+  highz_no_pulls(BC95_TX_PIN);
+  // #region agent log
+  Serial.println("[DBG-59d7ad] All VDD-domain pins Hi-Z, no pulls");
+  // #endregion
+
+  // Step 3: Power-cycle the load switches for a clean camera power-on reset.
+  pinMode(LD_SWCH_1, OUTPUT);
+  pinMode(LD_SWCH_2, OUTPUT);
+  digitalWrite(LD_SWCH_1, LOW);
+  digitalWrite(LD_SWCH_2, LOW);
+  Serial.printf("[DBG-59d7ad] LD_SWCH levels now: sw1=%d sw2=%d\n", digitalRead(LD_SWCH_1), digitalRead(LD_SWCH_2));
+
+  // While rails are OFF, actively pull SCCB lines LOW to discharge any residual charge
+  // and force a clean power-on reset of the camera/sensors (pull-ups are on the switched rail).
+  pinMode(SIOD_GPIO_NUM, OUTPUT);
+  pinMode(SIOC_GPIO_NUM, OUTPUT);
+  digitalWrite(SIOD_GPIO_NUM, LOW);
+  digitalWrite(SIOC_GPIO_NUM, LOW);
+  pinMode(XCLK_GPIO_NUM, OUTPUT);
+  digitalWrite(XCLK_GPIO_NUM, LOW);
+
+  // #region agent log
+  Serial.println("[DBG-59d7ad] LD_SWCH LOW — rails off, discharging SCCB/XCLK");
+  // #endregion
+
+  // Give the power switch time to fully turn off and peripherals time to brown out.
+  delay(fromDeepSleep ? 800 : 500);
+
+  // Return lines to Hi-Z before powering rails back on.
+  highz_no_pulls(SIOD_GPIO_NUM);
+  highz_no_pulls(SIOC_GPIO_NUM);
+  highz_no_pulls(XCLK_GPIO_NUM);
+
+  digitalWrite(LD_SWCH_1, HIGH);
+  digitalWrite(LD_SWCH_2, HIGH);
+  Serial.printf("[DBG-59d7ad] LD_SWCH levels after HIGH: sw1=%d sw2=%d\n", digitalRead(LD_SWCH_1), digitalRead(LD_SWCH_2));
+  // #region agent log
+  Serial.printf("[DBG-59d7ad] LD_SWCH HIGH — waiting 2500ms (t=%lu)\n", millis());
+  // #endregion
+  delay(2500);
+
+  // Step 4: Reset I2C controller state before camera/OLED use.
+  Wire.end();
+  i2c_bus_initialized = false;
+  pinMode(SIOD_GPIO_NUM, INPUT);
+  pinMode(SIOC_GPIO_NUM, INPUT);
+  delay(50);
+
+  // Step 5 (wake only): Avoid gpio_reset_pin() on GPIO1/GPIO2 (shared SCCB/I2C lines).
+  // On ESP32-S3 those pins can have special boot/USB roles and resetting them here has
+  // caused intermittent SCCB probe failures after deep sleep.
+  // Instead, perform a hard I2C bus recovery *after* rails are up, then leave pin
+  // configuration to esp_camera_init().
+  {
+    // Temporarily enable internal pull-ups (rail is ON now) to help the bus reach a clean HIGH
+    // even if external pull-ups are weak.
+    pinMode(SIOD_GPIO_NUM, INPUT_PULLUP);
+    pinMode(SIOC_GPIO_NUM, INPUT_PULLUP);
+    delay(5);
+    i2cBusRecover();
+    // Back to Hi-Z/no-pulls; camera driver will configure SCCB.
+    highz_no_pulls(SIOD_GPIO_NUM);
+    highz_no_pulls(SIOC_GPIO_NUM);
+  }
+
+  // #region agent log
+  Serial.printf("[DBG-59d7ad] I2C reset+recovery done, ready for camera init (t=%lu)\n", millis());
+  // #endregion
 
   Serial.begin(115200);
   delay(500);
@@ -1587,9 +2155,8 @@ void setup() {
     delay(10);
   }
 
-  // Optional: boot detection and PSRAM
+  // Optional: boot detection and PSRAM (wakeupCause already read at start of setup)
   esp_reset_reason_t resetReason = esp_reset_reason();
-  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
   if (resetReason == ESP_RST_POWERON) {
     Serial.println("=== COLD BOOT ===");
   } else if (wakeupCause == ESP_SLEEP_WAKEUP_TIMER || wakeupCause == ESP_SLEEP_WAKEUP_EXT0 || wakeupCause == ESP_SLEEP_WAKEUP_EXT1) {
@@ -1598,7 +2165,7 @@ void setup() {
   } else {
     Serial.println("=== WARM RESET ===");
   }
-  Serial.println("Camera power ON (GPIO 13)");
+  Serial.println("Load switches ON (GPIO 13, 14)");
   heap_caps_malloc_extmem_enable(100000);
 
   // Phase 1b: camera init with retry
@@ -1611,11 +2178,24 @@ void setup() {
       break;
     }
     if (attempt < MAX_CAMERA_RETRIES) {
-      Serial.println("Cleaning up and waiting 2s before retry...");
+      Serial.println("Cleaning up and HW-resetting camera (LD_SWCH_1 cycle)...");
       esp_camera_deinit();
       s_camera_initialised = false;
       is_initialised = false;
-      delay(2000);
+      forceStopXclk();
+      // Drive SDA/SCL/XCLK LOW to prevent back-feed, then cut power
+      prepareVddDomainPinsForSleep();
+      pinMode(SIOD_GPIO_NUM, OUTPUT); digitalWrite(SIOD_GPIO_NUM, LOW);
+      pinMode(SIOC_GPIO_NUM, OUTPUT); digitalWrite(SIOC_GPIO_NUM, LOW);
+      pinMode(XCLK_GPIO_NUM, OUTPUT); digitalWrite(XCLK_GPIO_NUM, LOW);
+      digitalWrite(LD_SWCH_1, LOW);
+      delay(500);
+      // Hi-Z before powering back on
+      highz_no_pulls(SIOD_GPIO_NUM);
+      highz_no_pulls(SIOC_GPIO_NUM);
+      highz_no_pulls(XCLK_GPIO_NUM);
+      digitalWrite(LD_SWCH_1, HIGH);
+      delay(2500);
     }
   }
   if (!cameraOk) {
@@ -1623,6 +2203,12 @@ void setup() {
   }
 
   // Phase 1c: I2C and OLED (after camera; same GPIO1/2 for I2C)
+  // esp_camera_init() brings up SCCB (I2C) internally, so we take ownership of the bus here.
+  // This avoids "Bus already started" warnings and reduces the chance of stale I2C state.
+  Wire.end();
+  i2c_bus_initialized = false;
+  delay(10);
+
   Serial.printf("Initializing SSD1315 OLED (I2C SDA: GPIO%d, SCL: GPIO%d)...\n", SIOD_GPIO_NUM, SIOC_GPIO_NUM);
   initI2CBusOnce();
   if (!u8g2.begin()) {
@@ -1633,15 +2219,6 @@ void setup() {
     delay(2000);
   }
   oled_status("Starting...", "Init done", 0);
-
-  if (useSHT30) {
-    Serial.println("Initializing SHT30...");
-    if (sht30.begin() == 0) {
-      Serial.println("SHT30 OK");
-    } else {
-      Serial.println("SHT30 init failed");
-    }
-  }
   if (useFuelGauge) {
     if (initializeMAX17048()) {
       Serial.println("MAX17048 OK");
@@ -1670,16 +2247,44 @@ void setup() {
 
   initializeDeviceIdentity();
 
-  if (useGNSS) {
-    while (!gnss.begin()) {
-      Serial.println("GNSS not found");
-      oled_status("GNSS not", "found", -1);
-      delay(1000);
+  // --- Operational window gate: skip work and sleep if outside daytime window ---
+  {
+    int gateHour = -1, gateMin = -1;
+    String gateRaw;
+    bool gotTime = queryNetworkTime(gateHour, gateMin, gateRaw);
+    if (gotTime) {
+      int q1 = gateRaw.indexOf('"');
+      int q2 = (q1 >= 0) ? gateRaw.indexOf('"', q1 + 1) : -1;
+      String payload = (q1 >= 0 && q2 > q1) ? gateRaw.substring(q1, q2 + 1) : "";
+      NetworkTime nt;
+      if (parseNetworkTimeFull(payload, nt)) {
+        int localSec = resolveLocalSecondOfDay(nt);
+        int lh = localSec / 3600;
+        int lm = (localSec % 3600) / 60;
+        Serial.printf("[SCHED] Local time: %02d:%02d (TZ: %s%+d qh)\n",
+                      lh, lm,
+                      nt.hasTz ? "modem " : "fallback ",
+                      nt.hasTz ? nt.tzQuarterHours : FALLBACK_TZ_QUARTER_HOURS);
+
+        if (!isInsideOperationalWindow(localSec)) {
+          int sleepSec = secondsUntilNextWake(localSec);
+          Serial.printf("[SCHED] Outside window (%02d:%02d-%02d:%02d). Sleeping %ds until next wake.\n",
+                        WAKE_HOUR, WAKE_MINUTE, NAP_HOUR, NAP_MINUTE, sleepSec);
+          char schedMsg[32];
+          snprintf(schedMsg, sizeof(schedMsg), "Sleep %dh%02dm", sleepSec / 3600, (sleepSec % 3600) / 60);
+          oled_status("NIGHT MODE", schedMsg, -1);
+          customSleepDuration = sleepSec;
+          enterSleepMode();
+        } else {
+          Serial.printf("[SCHED] Inside window (%02d:%02d-%02d:%02d). Proceeding.\n",
+                        WAKE_HOUR, WAKE_MINUTE, NAP_HOUR, NAP_MINUTE);
+        }
+      } else {
+        Serial.printf("[SCHED] CCLK time invalid (%s). Proceeding with default cycle.\n", gateRaw.c_str());
+      }
+    } else {
+      Serial.println("[SCHED] Network time unavailable. Proceeding with default cycle.");
     }
-    gnss.enablePower();
-    gnss.setGnss(eGPS_BeiDou_GLONASS);
-    gnss.setRgbOff();
-    getGNSS();
   }
 
   s_serialMutex = xSemaphoreCreateMutex();
