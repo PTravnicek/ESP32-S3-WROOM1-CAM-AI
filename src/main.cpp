@@ -6,6 +6,8 @@
 #include "freertos/semphr.h"
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <sys/time.h>
 #include "soc/rtc_cntl_reg.h"
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
@@ -19,6 +21,9 @@
 #include "esp_random.h"
 #include "esp_mac.h"
 #include "mbedtls/sha256.h"
+#include "esp_rom_md5.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include <WiFi.h>
 #include <cmath>
 #include <ArduinoJson.h>
@@ -32,7 +37,7 @@
 #include "model-parameters/model_variables.h"
 
 // Load switches (active high, keep ACTIVE for peripherals)
-#define LD_SWCH_1 13  // Camera (GNSS moved to permanent 3.3V for hot-start fixes)
+#define LD_SWCH_1 13  // Camera + GNSS (jumper VDD1). Camera only if GNSS on 3V1 jumper.
 #define LD_SWCH_2 14  // OLED, MAX17048
 
 // Camera pins (DFR0975)
@@ -119,6 +124,10 @@ int topCropPercent = 40;
 #define uS_TO_S_FACTOR 1000000ULL
 #define DEFAULT_SLEEP_TIME 3600  // seconds
 RTC_DATA_ATTR int customSleepDuration = DEFAULT_SLEEP_TIME;
+// Whether the upcoming daytime sleep should arm PIR wake. Set per geofence state
+// by configureDaytimeSleepForState() from the state's pir_home/away_mode; the
+// no-fix/retry paths leave it at the default (armed) so motion can still wake.
+static bool s_daytimePirArm = true;
 
 // Operational window (local time). Active between WAKE and NAP; sleeps outside.
 // Handles midnight-spanning sleep windows (e.g. NAP 20:00 → WAKE 06:00).
@@ -129,9 +138,47 @@ RTC_DATA_ATTR int customSleepDuration = DEFAULT_SLEEP_TIME;
 // Fallback TZ offset in quarter-hours from UTC, used when modem CCLK lacks a TZ suffix.
 // CET (UTC+1) = 4, CEST (UTC+2) = 8.
 #define FALLBACK_TZ_QUARTER_HOURS 0
+// FIELD FINDING 2026-07-29 (fw v9 regression): the Czech NB-IoT operator
+// delivers CCLK in LOCAL time with NO TZ suffix — not UTC as assumed. v9
+// enabled the EU-DST auto fallback below, which added CEST (+2 h) on top of
+// already-local time: the device slept 20:00–04:00 instead of 22:00–06:00
+// (confirmed from server-side check-in timestamps, both edges shifted −2 h).
+// Default is therefore 0: treat suffix-less CCLK as already-local, exactly
+// like fw ≤v8. Enable (build flag) ONLY for a network proven to send UTC,
+// e.g. by comparing CCLK against GNSS time on the bench.
+#ifndef FALLBACK_TZ_AUTO_CZ
+#define FALLBACK_TZ_AUTO_CZ 0
+#endif
 
 #define BC95_RX_PIN 44  // ESP32 RX connected to BC95 TX
 #define BC95_TX_PIN 43  // ESP32 TX connected to BC95 RX
+
+// Modem UART baud. Raised from 9600 to 115200 so OTA (~2.3 MB) downloads in
+// ~4 min instead of ~45 min. The firmware auto-detects the modem's current baud
+// on boot and raises it (AT+IPR) when it is still at the fallback — so a fresh
+// module, or one reset by AT&F0, is migrated transparently. Drop to 9600 (set
+// BC95_BAUD to BC95_BAUD_FALLBACK) if your wiring can't sustain 115200.
+#ifndef BC95_BAUD
+#define BC95_BAUD 115200
+#endif
+#ifndef BC95_BAUD_FALLBACK
+#define BC95_BAUD_FALLBACK 9600
+#endif
+// Factory-reset (AT&F0) the modem during the "not registered" full-init path. Default OFF:
+// AT&F0 wipes the persisted UART baud (back to 9600 → 30-attempt fallback next boot) AND the
+// APN, so a board that merely lost coverage would re-provision from scratch every boot. With
+// it OFF, baud/APN/PSM persist (AT&W) and an unregistered board just re-attaches at 115200.
+// Turn ON only to force a clean re-provision of a misbehaving/used module.
+#ifndef BC95_FACTORY_RESET_ON_PROVISION
+#define BC95_FACTORY_RESET_ON_PROVISION 0
+#endif
+// Bench flag: skip all modem uplink work in the main job (registration, telemetry TCP, OTA)
+// so the device goes GNSS → sleep quickly. Lets you capture a clean GNSS sleep-current trace
+// without the modem registration churn (which can add minutes of awake time on a SIM/coverage
+// failure). GNSS acquisition + the EXTINT standby/wake path still run. Bench only — no uplink.
+#ifndef BENCH_SKIP_UPLINK
+#define BENCH_SKIP_UPLINK 0
+#endif
 
 // HC-SR501 PIR OUT (3.3 V, active HIGH) — deep-sleep wake on motion during daytime only.
 #define PIR_WAKE_GPIO 10
@@ -147,15 +194,59 @@ static const int TCP_PORT = 8009;
 static bool moduleInitialized = false;
 
 // TCP receive: optional wait for server response after sending data (AT+QIRD)
-#define TCP_WAIT_FOR_SERVER_RESPONSE 0  // 0 = one-way upload only; 1 = wait for server JSON/command
+#define TCP_WAIT_FOR_SERVER_RESPONSE 1  // 0 = one-way upload only; 1 = wait for server JSON/command
+// Enabled so the server can push runtime config (set_config) + OTA replies after
+// each image upload. Adds ~1-2s awake per cycle waiting for the reply.
 #define TCP_RECV_TIMEOUT_MS 15000   // How long to wait for server response
 #define TCP_RECV_POLL_MS    1000    // Poll interval for AT+QIRD
 #define TCP_RECV_BUFFER_SIZE 512    // Max command size from server
 
+// ---- OTA over NB-IoT (raw TCP, length-framed). See OTA-NB-IoT.md ----
+#ifndef FW_VERSION
+#define FW_VERSION 1            // running firmware version (also settable via build_flags)
+#endif
+#ifndef OTA_SERVER_IP
+#define OTA_SERVER_IP SERVER_IP // OTA server host (default: same VM as telemetry)
+#endif
+#ifndef OTA_TCP_PORT
+#define OTA_TCP_PORT 8010       // OTA server port (telemetry server stays on TCP_PORT)
+#endif
+// Check for a new image on every true power-on (cold boot). Handy for bench
+// testing: power-cycle the board to trigger an update check. Set to 0 for
+// production and drive updates with the server {"cmd":"ota"} command instead.
+#ifndef OTA_CHECK_ON_COLD_BOOT
+#define OTA_CHECK_ON_COLD_BOOT 1
+#endif
+// Honor a server {"cmd":"ota"} reply (requires TCP_WAIT_FOR_SERVER_RESPONSE=1).
+#ifndef OTA_VIA_SERVER_COMMAND
+#define OTA_VIA_SERVER_COMMAND 1
+#endif
+#ifndef OTA_READ_CHUNK_TIMEOUT_MS
+#define OTA_READ_CHUNK_TIMEOUT_MS 120000UL  // per-chunk QIRD budget (NB-IoT is slow)
+#endif
+#ifndef OTA_DOWNLOAD_BUDGET_MS
+#define OTA_DOWNLOAD_BUDGET_MS (60UL * 60UL * 1000UL)  // 60 min max (9600 baud ~44 min + margin)
+#endif
+// Poll interval while the modem RX buffer is momentarily empty mid-download.
+// Shorter than the 1 s telemetry poll so we keep up with the server's pacing.
+#ifndef OTA_RX_POLL_MS
+#define OTA_RX_POLL_MS 300
+#endif
+// Bytes per AT+QIRD. MUST match the modem's socket read cap: this module rejects
+// larger read lengths with ERROR (the telemetry path uses TCP_RECV_BUFFER_SIZE=512
+// and the OTA header read uses 512 — both work; 1200 made QIRD return ERROR).
+#ifndef OTA_QIRD_READ_LEN
+#define OTA_QIRD_READ_LEN 512
+#endif
+static volatile bool g_otaRequested = false;
+#if OTA_CHECK_ON_COLD_BOOT
+static bool g_otaColdBootPending = false;
+#endif
+
 static bool usePSM = true;  // Keep modem in PSM during ESP deep sleep to minimize current (modem supply stays on)
 #define PSM_ACTIVE_TIME "00100001"   // 1 minute
 #define PSM_PERIODIC_TAU "00100001"  // 1 hour
-static bool useEDRX = true;
+static bool useEDRX = false;  // eDRX + PSM together raises sleep current; PSM-only for min power
 #define EDRX_CYCLE "0011"  // 40.96 seconds
 
 static uint64_t device_id = 0;
@@ -172,6 +263,53 @@ static struct { float temperature = 0.0f; float humidity = 0.0f; } sensorData;
 
 // GNSS (u-blox MAX-M10S) on I2C (DDC)
 #define GNSS_I2C_ADDR 0x42
+
+// --- EXTINT hot-start wake (requires PCB rework) ---
+// Per the MAX-M10S integration manual, software standby (UBX-RXM-PMREQ) can only be woken by
+// UART RX or EXTINT — not by DDC/I2C. On the stock board EXTINT (U15-5) is driven by the
+// open-drain antenna-supervisor buffer U16-Y1 (no pull-up); when standby drops LNA_EN the
+// antenna-sense node decays and toggles EXTINT, waking the receiver back to ~24 mA tracking
+// (~8 s in). HW fix: cut EXTINT from U16-Y1 and wire it to GNSS_WAKE_PIN. Firmware then holds
+// EXTINT LOW (idle) through deep sleep — no spurious wake — and pulses it HIGH to wake the
+// receiver from standby WITHOUT clearing BBR, preserving hot start (V_IO keeps BBR alive).
+// Leave at 0 on un-reworked boards. When 1, the PMREQ also arms EXTINT0 as the wake source.
+#ifndef GNSS_EXTINT_WAKE
+#define GNSS_EXTINT_WAKE 0
+#endif
+#ifndef GNSS_WAKE_PIN
+#define GNSS_WAKE_PIN 16   // bodge to U15-5 EXTINT. RTC GPIOs (0..21) hold via rtc_gpio_hold;
+#endif                     // non-RTC pins (e.g. GPIO38) hold via gpio_hold + deep-sleep hold.
+#ifndef GNSS_EXTINT_WAKE_SETTLE_MS
+#define GNSS_EXTINT_WAKE_SETTLE_MS 120UL  // hold EXTINT high while RF/clock spin up after wake
+#endif
+
+// Bench diagnostic for the GNSS deep-sleep current investigation. When 1, the sleep
+// path logs the I2C ack of 0x42/0x3C/0x36 with all rails on, and of 0x42 again after
+// the camera rail is cut. The post-cut probe re-touches the bus and WILL wake the M10
+// from backup, so this is for root-causing the clamp only — never ship with it set.
+#ifndef GNSS_SLEEP_DIAG
+#define GNSS_SLEEP_DIAG 0
+#endif
+
+// Bench diagnostic: keep the camera rail (LD_SWCH_1) POWERED through deep sleep instead of
+// cutting it, so the shared I2C bus cannot be clamped by the decaying/unpowered camera.
+// If the M10 then stays in software backup for the whole sleep window (measured floor ~µA
+// above the camera's idle current, not ~24 mA tracking), the camera-rail glitch is the
+// confirmed wake source and hardware bus isolation is the fix. Costs camera idle current —
+// this is NOT a low-power production setting, only a root-cause confirmation build.
+#ifndef GNSS_SLEEP_NO_RAIL_CUT
+#define GNSS_SLEEP_NO_RAIL_CUT 0
+#endif
+
+// Bench diagnostic: for one sleep cycle, power the BC95 RF fully off (AT+CFUN=0) instead of
+// configuring PSM, and force timer-only sleep (no PIR). Camera rail is cut as normal. This
+// removes the modem (its DRX paging RF bursts and PSM-entry transient) as a variable. If the
+// M10 then stays in software backup (floor << 1 mA, no ~24 mA step ~7-9 s in), the modem is
+// the confirmed wake source. If it still steps to ~24 mA, the modem is exonerated. Not a
+// production setting — the modem is left RF-off, so no uplink on the next wake until re-init.
+#ifndef GNSS_SLEEP_MODEM_OFF_TEST
+#define GNSS_SLEEP_MODEM_OFF_TEST 0
+#endif
 
 #ifndef GNSS_ACQUIRE_TIMEOUT_MS
 #define GNSS_ACQUIRE_TIMEOUT_MS 60000UL
@@ -208,8 +346,19 @@ struct GnssFix {
 
 static GnssFix g_gnssLastFix;
 
-// Home geofence + daytime sleep intervals (NVS-backed, see loadSleepGeoFromNvs)
-static const uint32_t kSleepGeoMagic = 0x50474553u;  // 'SGEP'
+// Per-state PIR wake mode (in-depot "home" and deployed "away" daytime sleep).
+enum PirMode : uint8_t {
+  PIR_MODE_PIR_TIMER = 0,  // wake on motion OR after sleep_X_s (current behaviour)
+  PIR_MODE_TIMER_ONLY = 1, // ignore PIR, wake only after sleep_X_s
+  PIR_MODE_PIR_ONLY   = 2, // wake only on motion (timer capped at PIR_ONLY_SAFETY_S)
+};
+static const uint32_t PIR_ONLY_SAFETY_S = 86400;  // worst-case wake bound for PIR-only
+
+// Home geofence + daytime sleep intervals + operational window + PIR modes
+// (NVS-backed, see loadSleepGeoFromNvs). Magic bumped whenever fields change so
+// old blobs are discarded and defaults re-applied (then the server pushes the
+// desired values via set_config).
+static const uint32_t kSleepGeoMagic = 0x53474532u;  // 'SGE2' (was 'SGEP' before wake/nap/pir fields)
 #pragma pack(push, 1)
 struct SleepGeoConfig {
   uint32_t magic = 0;
@@ -218,6 +367,13 @@ struct SleepGeoConfig {
   uint32_t home_radius_m = 0;   // 0 = geofence disabled
   uint32_t sleep_home_s = 0;
   uint32_t sleep_away_s = 0;
+  // Operational window (local time), formerly the WAKE_/NAP_ compile-time macros.
+  uint8_t wake_hour = 0;
+  uint8_t wake_minute = 0;
+  uint8_t nap_hour = 0;
+  uint8_t nap_minute = 0;
+  uint8_t pir_home_mode = PIR_MODE_PIR_TIMER;  // PirMode
+  uint8_t pir_away_mode = PIR_MODE_PIR_TIMER;  // PirMode
 };
 #pragma pack(pop)
 
@@ -676,10 +832,11 @@ static size_t gnssDdcReadPayload(uint8_t* out, size_t outMax, uint16_t* availOut
   return got;
 }
 
-/** Send a UBX frame over DDC (I2C). Checksum is computed here, not hand-typed. */
-static void gnssSendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+/** Send a UBX frame over DDC (I2C). Checksum is computed here, not hand-typed.
+ * Returns the Wire.endTransmission() status (0 = ACK/OK, non-zero = NACK/error). */
+static uint8_t gnssSendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
   uint8_t frame[8 + 32];
-  if (len > 32) return;
+  if (len > 32) return 0xFF;
   size_t n = 0;
   frame[n++] = 0xB5;                       // sync 1
   frame[n++] = 0x62;                       // sync 2
@@ -694,15 +851,53 @@ static void gnssSendUbx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_
   frame[n++] = ckB;
   Wire.beginTransmission(GNSS_I2C_ADDR);
   Wire.write(frame, n);
-  Wire.endTransmission(true);
+  return Wire.endTransmission(true);
 }
 
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_EXTINT_WAKE
+/** Drive the rewired EXTINT line to its idle (no-wake) LOW level, latched across deep sleep. */
+static void gnssExtintIdleAndHold(void) {
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)GNSS_WAKE_PIN)) rtc_gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  else gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  pinMode(GNSS_WAKE_PIN, OUTPUT);
+  digitalWrite(GNSS_WAKE_PIN, LOW);
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)GNSS_WAKE_PIN)) rtc_gpio_hold_en((gpio_num_t)GNSS_WAKE_PIN);
+  else gpio_hold_en((gpio_num_t)GNSS_WAKE_PIN);
+}
+
+/** Release the latch and leave EXTINT idle LOW as a normal output (call once early on boot). */
+static void gnssExtintInit(void) {
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)GNSS_WAKE_PIN)) rtc_gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  else gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  pinMode(GNSS_WAKE_PIN, OUTPUT);
+  digitalWrite(GNSS_WAKE_PIN, LOW);
+}
+
+/** Pulse EXTINT HIGH to wake the M10 from software standby (hot start — BBR is preserved). */
+static void gnssExtintWakePulse(void) {
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)GNSS_WAKE_PIN)) rtc_gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  else gpio_hold_dis((gpio_num_t)GNSS_WAKE_PIN);
+  pinMode(GNSS_WAKE_PIN, OUTPUT);
+  digitalWrite(GNSS_WAKE_PIN, LOW);
+  delay(2);
+  digitalWrite(GNSS_WAKE_PIN, HIGH);          // rising edge / high level = wake
+  delay(GNSS_EXTINT_WAKE_SETTLE_MS);          // stay high while RF + clock spin up
+  digitalWrite(GNSS_WAKE_PIN, LOW);           // back to idle (no-wake) level
+  Serial.printf("[GNSS] EXTINT wake pulse on GPIO%d (hot-start)\n", GNSS_WAKE_PIN);
+}
+#endif
+
 /**
- * Nudge the MAX-M10S out of software backup. Any DDC activity wakes it; a benign
- * 1-byte write (sets the read-stream register pointer) plus a settle delay lets
- * the RF front-end and clock spin back up before we start reading NMEA.
+ * Nudge the MAX-M10S out of software backup. With the EXTINT rework (GNSS_EXTINT_WAKE) a
+ * rising edge on EXTINT is the spec-valid wake from software standby; the DDC byte below is
+ * only kept to (re)set the read-stream register pointer afterwards. Without the rework, the
+ * DDC write is the (best-effort) nudge. Either way a settle delay lets the RF front-end and
+ * clock spin back up before we start reading NMEA.
  */
 static void gnssWakeFromBackup(void) {
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_EXTINT_WAKE
+  gnssExtintWakePulse();
+#endif
   Wire.beginTransmission(GNSS_I2C_ADDR);
   Wire.write((uint8_t)0xFF);
   Wire.endTransmission(true);
@@ -721,22 +916,41 @@ static void gnssEnterBackup(void) {
   Wire.begin(SIOD_GPIO_NUM, SIOC_GPIO_NUM);
   Wire.setClock(I2C_CLOCK_HZ);
   delay(2);
-  static const uint8_t pmreq[16] = {
+  uint8_t pmreq[16] = {
     0x00,                    // version
     0x00, 0x00, 0x00,        // reserved
-    0x00, 0x00, 0x00, 0x00,  // duration = 0 -> until host I/O wakeup
+    0x00, 0x00, 0x00, 0x00,  // duration = 0 -> indefinite (until a wake source / RESET_N)
     0x06, 0x00, 0x00, 0x00,  // flags: bit1 backup | bit2 force
-    0x00, 0x00, 0x00, 0x00   // wakeupSources = 0 (wake on DDC / host activity)
+    0x00, 0x00, 0x00, 0x00   // wakeupSources (set below)
   };
-  gnssSendUbx(0x02, 0x41, pmreq, sizeof(pmreq));
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_EXTINT_WAKE
+  pmreq[12] = 0x20;          // wakeupSources bit5 = EXTINT0 — host-controlled hot-start wake
+#endif
+  uint8_t ack = gnssSendUbx(0x02, 0x41, pmreq, sizeof(pmreq));
   delay(50);
   Wire.end();
   i2c_bus_initialized = false;
   // Leave bus quiet: hi-Z, no pulls — do not drive SDA/SCL after this.
   highz_no_pulls(SIOD_GPIO_NUM);
   highz_no_pulls(SIOC_GPIO_NUM);
-  Serial.println("[GNSS] UBX-RXM-PMREQ backup+force sent (low-power during sleep)");
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_EXTINT_WAKE
+  // Latch the rewired EXTINT LOW (idle) so nothing wakes the receiver until we pulse it.
+  gnssExtintIdleAndHold();
+  Serial.printf("[GNSS] EXTINT0 armed as wake source; GPIO%d held LOW for standby\n", GNSS_WAKE_PIN);
+#endif
+  // ack==0 => GNSS ACKed the PMREQ (command landed). Non-zero => the write was
+  // NACKed (bus contention / back-powered peripherals) and the chip never got the
+  // request — it would then stay in ~23 mA tracking through sleep.
+  Serial.printf("[GNSS] UBX-RXM-PMREQ backup+force sent (I2C ack=%u, 0=OK)\n", ack);
 }
+
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_SLEEP_DIAG
+/** Probe an I2C address and return the Wire ack (0=ACK/OK, 5=timeout i.e. line clamped). */
+static uint8_t gnssDiagAck(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission(true);
+}
+#endif
 
 static bool gnssReadLatestFixSinceWake(GnssFix& outFix, unsigned long timeoutMs,
                                        GnssProgressCb progressCb = nullptr) {
@@ -1182,6 +1396,9 @@ void ei_camera_deinit(void) {
 static void configurePSM(void);
 static void prepareModuleForPSM(void);
 static void wakeModuleFromPSM(void);
+static String sendATCommand(const String& cmd, unsigned long waitMs);
+static bool pollSettingsOverTCP(void);
+static bool runOtaUpdate(void);
 
 static void highz_no_pulls(int g) {
   if (g < 0) return;
@@ -1375,10 +1592,11 @@ static void handleSpuriousPirWakeAndResleep(void) {
 }
 #endif  // PIR_WAKE_ENABLE
 
-/** Daytime deep sleep: timer + optional PIR (operational window). */
+/** Daytime deep sleep: timer + optional PIR (operational window). PIR arming
+ *  follows the per-state mode captured in s_daytimePirArm. */
 static void enterDaytimeSleepMode(void) {
 #if PIR_WAKE_ENABLE
-  setPirWakeOnNextSleep(true);
+  setPirWakeOnNextSleep(s_daytimePirArm);
 #endif
   enterSleepMode();
 }
@@ -1405,11 +1623,17 @@ static void enterSleepMode(void) {
     initI2CBusOnce();
   }
 
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_SLEEP_MODEM_OFF_TEST
+  Serial.println("[GNSS-DIAG] MODEM_OFF: AT+CFUN=0 (removing modem RF as a wake variable)");
+  sendATCommand("AT+CFUN=0", 2000);
+  delay(500);
+#else
   if (usePSM) {
     Serial.println("Configuring NB-IoT PSM...");
     configurePSM();
     prepareModuleForPSM();
   }
+#endif
 
   // 1) Stop radios
   WiFi.disconnect(true);
@@ -1442,14 +1666,66 @@ static void enterSleepMode(void) {
     Serial.printf("SLEEPING... %s (no OLED this wake)\n", sleepMsg);
   }
 
-  // 6) Camera-domain pins benign before cutting switched rails.
+  // 6) Peripheral pins benign before cutting switched rails.
   prepareVddDomainPinsForSleep();
-  // While VDD is still up, sink I2C pull-up current so the camera cannot back-feed.
-  pinMode(SIOC_GPIO_NUM, OUTPUT); digitalWrite(SIOC_GPIO_NUM, LOW);
-  pinMode(SIOD_GPIO_NUM, OUTPUT); digitalWrite(SIOD_GPIO_NUM, LOW);
-  pinMode(XCLK_GPIO_NUM, OUTPUT); digitalWrite(XCLK_GPIO_NUM, LOW);
+  pinMode(XCLK_GPIO_NUM, OUTPUT);
+  digitalWrite(XCLK_GPIO_NUM, LOW);
   highz_no_pulls(BC95_RX_PIN);
   highz_no_pulls(BC95_TX_PIN);
+
+#if HAS_GNSS && GNSS_POWER_PERMANENT
+  // 7) MAX-M10S on permanent 3.3 V, sharing this single DDC/I2C bus (pull-ups to the
+  // permanent 3V3 rail) with the camera (LD_SWCH_1) and the OLED + MAX17048 (LD_SWCH_2).
+  // Two hard constraints collide:
+  //   * the backup request (UBX-RXM-PMREQ) must be the LAST bus edge — the M10 wakes
+  //     from software backup on any DDC activity, so cutting a bus peripheral's rail
+  //     AFTER backup re-wakes it into ~23 mA tracking; AND
+  //   * the write needs a live bus — once a peripheral loses power its I/O pins clamp
+  //     SDA/SCL low and the master times out (observed: I2C ack=5), so the request
+  //     never lands and the M10 also stays awake.
+  // Resolution: send the backup request while the camera is STILL powered (the bus is
+  // healthy → ack 0), THEN cut the camera rail with no further I2C. Sequencing it the
+  // other way (cut rail first, then PMREQ over the clamped bus) is what produced ack=5
+  // and left the M10 tracking. LD_SWCH_2 stays powered through sleep so that only the
+  // camera can clamp the bus on rail-cut (costs OLED/MAX17048 idle current, far less than
+  // the GNSS tracking current it saves).
+  //
+  // Remaining risk: cutting the camera rail clamps the shared SDA/SCL low — a falling edge
+  // the M10 may read as DDC activity and wake on. If measured sleep current stays ~24 mA
+  // even though ack reads 0, that glitch is the cause and hardware bus isolation is
+  // required (GNSS on its own I2C bus, or a bus switch/isolator on the camera SCCB). Build
+  // with -DGNSS_SLEEP_DIAG=1 to confirm the clamp (logs ack before/after the rail cut).
+  initI2CBusOnce();
+#if GNSS_SLEEP_DIAG
+  Serial.printf("[GNSS-DIAG] rails ON: ack 0x42=%u 0x3C=%u 0x36=%u (expect 0,0,0)\n",
+                gnssDiagAck(GNSS_I2C_ADDR), gnssDiagAck(0x3C), gnssDiagAck(MAX17048_I2C_ADDR));
+#endif
+  gnssEnterBackup();  // PMREQ on a healthy bus → ack should be 0; M10 enters software backup
+#if GNSS_SLEEP_NO_RAIL_CUT
+  Serial.println("[GNSS-DIAG] NO_RAIL_CUT: leaving camera rail (LD_SWCH_1) POWERED through sleep");
+#else
+  Serial.println("Turning camera rail OFF (LD_SWCH_1); keeping LD_SWCH_2 alive for I2C");
+  digitalWrite(LD_SWCH_1, LOW);
+  delay(20);
+#endif
+#if GNSS_SLEEP_DIAG
+  // Characterise the clamp. This re-touches the bus and WILL wake the M10 — diag builds only.
+  initI2CBusOnce();
+  Serial.printf("[GNSS-DIAG] camera OFF: ack 0x42=%u (5=clamped/timeout confirms H1)\n",
+                gnssDiagAck(GNSS_I2C_ADDR));
+  Wire.end();
+  i2c_bus_initialized = false;
+  highz_no_pulls(SIOD_GPIO_NUM);
+  highz_no_pulls(SIOC_GPIO_NUM);
+#endif
+#else
+  // GNSS on LD_SWCH_1 (or no GNSS): sink shared I2C before rail off. If SDA/SCL
+  // are left floating while the camera is unpowered, the sensor back-feeds ~20 mA
+  // through the shared bus pull-ups.
+  pinMode(SIOC_GPIO_NUM, OUTPUT);
+  digitalWrite(SIOC_GPIO_NUM, LOW);
+  pinMode(SIOD_GPIO_NUM, OUTPUT);
+  digitalWrite(SIOD_GPIO_NUM, LOW);
 
   // 7) Power down switchable peripherals before deep sleep
   // LD_SWCH_1: camera (+ GNSS if jumper VDD1). LD_SWCH_2: OLED, MAX17048.
@@ -1458,24 +1734,36 @@ static void enterSleepMode(void) {
   digitalWrite(LD_SWCH_2, LOW);
   delay(5);
 
-#if HAS_GNSS && GNSS_POWER_PERMANENT
-  // GNSS on permanent 3.3 V (jumper 3V1): backup is the last I2C transaction.
-  highz_no_pulls(SIOD_GPIO_NUM);
-  highz_no_pulls(SIOC_GPIO_NUM);
-  delay(2);
-  gnssEnterBackup();
-#else
-  // GNSS unpowered (jumper VDD1 or no GNSS): I2C pull-ups on VDD are dead — safe to
-  // hold SDA/SCL LOW and prevent camera back-feed through the shared bus.
   holdPinLowForSleep(SIOC_GPIO_NUM);
   holdPinLowForSleep(SIOD_GPIO_NUM);
 #endif
 
   // Hold load switches + all camera-exclusive lines LOW. Unpowered camera modules
   // can otherwise back-feed ~20–30 mA through GPIO data pins (non-RTC pins cannot
-  // be rtc_gpio_isolate'd on ESP32-S3). SDA/SCL held only when GNSS rail is off.
+  // be rtc_gpio_isolate'd on ESP32-S3).
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_SLEEP_NO_RAIL_CUT
+  // Diagnostic: camera stays powered, so hold LD_SWCH_1 HIGH and DO NOT drive the camera
+  // DVP/SCCB pins (the sensor may be driving them) — leave them hi-Z (set earlier).
+  pinMode(LD_SWCH_1, OUTPUT);
+  digitalWrite(LD_SWCH_1, HIGH);
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)LD_SWCH_1)) rtc_gpio_hold_en((gpio_num_t)LD_SWCH_1);
+  else gpio_hold_en((gpio_num_t)LD_SWCH_1);
+#else
   holdPinLowForSleep(LD_SWCH_1);
+#endif
+#if HAS_GNSS && GNSS_POWER_PERMANENT
+  // Keep the OLED/MAX17048 rail powered through sleep so the shared I2C bus stays
+  // quiescent-high. Cutting it would clamp SDA/SCL and wake the M10 from backup.
+  pinMode(LD_SWCH_2, OUTPUT);
+  digitalWrite(LD_SWCH_2, HIGH);
+  if (rtc_gpio_is_valid_gpio((gpio_num_t)LD_SWCH_2)) rtc_gpio_hold_en((gpio_num_t)LD_SWCH_2);
+  else gpio_hold_en((gpio_num_t)LD_SWCH_2);
+#else
   holdPinLowForSleep(LD_SWCH_2);
+#endif
+#if !(HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_SLEEP_NO_RAIL_CUT)
+  // Camera is unpowered: drive its lines LOW to stop back-feed. In NO_RAIL_CUT diag the
+  // camera is still powered, so skip these (driving its outputs would cause contention).
   holdPinLowForSleep(XCLK_GPIO_NUM);
   holdPinLowForSleep(PCLK_GPIO_NUM);
   holdPinLowForSleep(VSYNC_GPIO_NUM);
@@ -1488,6 +1776,7 @@ static void enterSleepMode(void) {
   holdPinLowForSleep(Y7_GPIO_NUM);
   holdPinLowForSleep(Y8_GPIO_NUM);
   holdPinLowForSleep(Y9_GPIO_NUM);
+#endif
   gpio_deep_sleep_hold_en();
 
   // 8) Free classification photo
@@ -1526,7 +1815,11 @@ static void enterSleepMode(void) {
   delay(100);
 #if PIR_WAKE_ENABLE
   {
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_SLEEP_MODEM_OFF_TEST
+    const bool wantPir = false;  // diag: timer-only sleep, remove PIR/EXT1 as a variable
+#else
     const bool wantPir = s_enablePirWakeOnNextSleep;
+#endif
     s_enablePirWakeOnNextSleep = false;
     preparePirWakeForDeepSleep(wantPir);
   }
@@ -1610,10 +1903,32 @@ static bool waitForSendResult(unsigned long timeoutMs, const String& existingRes
 // because each payload byte is not hex-expanded on the UART and on the air.
 // Flow: "AT+QISEND=<id>,<len>" -> wait for '>' prompt -> stream raw bytes ->
 // wait for "SEND OK" / "SEND FAIL" / "ERROR".
+// Query the modem's per-connection sent-byte counter: AT+QISEND=<id>,0 replies
+// "+QISEND: <total_send_length>,<ackedbytes>,<unackedbytes>". Returns -1 when the
+// reply can't be parsed (treat as "unknown", never as zero).
+static long queryTCPSentBytes(int connectID) {
+  String r = sendATCommand(String("AT+QISEND=") + String(connectID) + ",0", 2000);
+  int p = r.indexOf("+QISEND:");
+  if (p == -1) return -1;
+  p += 8;
+  while (p < (int)r.length() && (r[p] == ' ')) p++;
+  long total = 0;
+  bool any = false;
+  while (p < (int)r.length() && isdigit((unsigned char)r[p])) { total = total * 10 + (r[p] - '0'); p++; any = true; }
+  return any ? total : -1;
+}
+
 static bool sendBinaryOverTCP(int connectID, const uint8_t* data, size_t length,
                               unsigned long promptTimeoutMs = 5000,
                               unsigned long ackTimeoutMs = 10000) {
   if (data == nullptr || length == 0) return false;
+
+  // Baseline of the modem's sent counter BEFORE this send. If the SEND OK
+  // acknowledgement later gets garbled on the UART (seen at 115200), we can ask
+  // the modem whether it actually took the bytes instead of blindly resending —
+  // a blind resend duplicates the chunk inside the TCP stream and corrupts the
+  // image on the server (accumulated > declared image_size, file never written).
+  long sentBefore = queryTCPSentBytes(connectID);
 
   modemFlushInput(5);
   String cmd = String("AT+QISEND=") + String(connectID) + "," + String((unsigned long)length) + "\r\n";
@@ -1658,6 +1973,24 @@ static bool sendBinaryOverTCP(int connectID, const uint8_t* data, size_t length,
       if (resp.indexOf("+CME ERROR") != -1) return false;
     }
     delay(5);
+  }
+
+  // ACK timed out or arrived garbled. Before reporting failure (which makes the
+  // caller RESEND the same chunk → duplicate bytes in the TCP stream), ask the
+  // modem how many bytes it has actually accepted on this connection. If the
+  // counter moved by exactly this chunk, the send succeeded and only the UART
+  // response was lost.
+  if (sentBefore >= 0) {
+    long sentAfter = queryTCPSentBytes(connectID);
+    if (sentAfter >= 0 && sentAfter == sentBefore + (long)length) {
+      Serial.printf("[TCP] ACK garbled but modem counter confirms %u bytes accepted (%ld -> %ld) — not resending\n",
+                    (unsigned)length, sentBefore, sentAfter);
+      return true;
+    }
+    if (sentAfter >= 0) {
+      Serial.printf("[TCP] ACK timeout, counter %ld -> %ld (expected %ld) — chunk NOT accepted, retry is safe\n",
+                    sentBefore, sentAfter, sentBefore + (long)length);
+    }
   }
   return false;
 }
@@ -1748,21 +2081,99 @@ static bool parseNetworkTimeFull(const String& payload, NetworkTime& nt) {
   return true;
 }
 
+// ---- fallback timezone when CCLK carries no TZ suffix -------------------
+// Day of week (0 = Sunday) for a Gregorian date — Sakamoto's method.
+static int dayOfWeekYmd(int y, int m, int d) {
+  static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+static int lastSundayOfMonth(int year, int month) {
+  static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int days = mdays[month - 1];
+  if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) days = 29;
+  return days - dayOfWeekYmd(year, month, days);
+}
+
+/** Effective fallback TZ (quarter-hours) for a UTC timestamp. With
+ *  FALLBACK_TZ_AUTO_CZ this is CET/CEST by the EU rule: summer time between
+ *  the last Sunday of March 01:00 UTC and the last Sunday of October 01:00 UTC. */
+static int fallbackTzQuarterHours(const NetworkTime& nt) {
+#if FALLBACK_TZ_AUTO_CZ
+  const int year = 2000 + nt.year;
+  const int marSun = lastSundayOfMonth(year, 3);
+  const int octSun = lastSundayOfMonth(year, 10);
+  bool summer;
+  if (nt.month > 3 && nt.month < 10)      summer = true;
+  else if (nt.month < 3 || nt.month > 10) summer = false;
+  else if (nt.month == 3)                 summer = (nt.day > marSun) || (nt.day == marSun && nt.hour >= 1);
+  else /* October */                      summer = (nt.day < octSun) || (nt.day == octSun && nt.hour < 1);
+  return summer ? 8 : 4;   // CEST = UTC+2, CET = UTC+1
+#else
+  (void)nt;
+  return FALLBACK_TZ_QUARTER_HOURS;
+#endif
+}
+
 /** Convert NetworkTime to local second-of-day (0..86399). */
 static int resolveLocalSecondOfDay(const NetworkTime& nt) {
   int sec = nt.hour * 3600 + nt.minute * 60 + nt.second;
   if (!nt.hasTz) {
-    sec += FALLBACK_TZ_QUARTER_HOURS * 900;
+    sec += fallbackTzQuarterHours(nt) * 900;
     sec %= 86400;
     if (sec < 0) sec += 86400;
   }
   return sec;
 }
 
+// ---- local clock persisted across deep sleep ----------------------------
+// ESP-IDF keeps the system clock advancing from the RTC across deep sleep, so a
+// clock seeded once from the modem survives every timer/PIR wake; only a true
+// power-on loses it. We store local-time-of-day as the epoch, so
+// time(NULL) % 86400 IS the local second of day (day rollover included).
+// This lets the operational-window gate run with zero radio on normal wakes.
+RTC_DATA_ATTR bool g_rtcClockValid = false;
+// Firmware version that seeded the persisted clock. RTC memory survives the
+// esp_restart after an OTA (and USB reflash), so a clock seeded under old TZ
+// semantics would otherwise outlive the firmware that wrote it — exactly how
+// the v9 +2h clock would have kept the window shifted even after the v10 fix.
+// A version mismatch forces one modem re-sync on the first wake.
+RTC_DATA_ATTR uint32_t g_rtcClockFwVersion = 0;
+
+static void persistLocalClock(int localSecOfDay) {
+  struct timeval tv;
+  tv.tv_sec = (time_t)localSecOfDay;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  g_rtcClockValid = true;
+  g_rtcClockFwVersion = (uint32_t)FW_VERSION;
+}
+
+static bool rtcLocalSecondOfDay(int& outSec) {
+  if (!g_rtcClockValid) return false;
+  if (g_rtcClockFwVersion != (uint32_t)FW_VERSION) {
+    Serial.printf("[SCHED] Persisted clock is from fw v%u (now v%u) — discarding, will re-sync from modem.\n",
+                  (unsigned)g_rtcClockFwVersion, (unsigned)FW_VERSION);
+    g_rtcClockValid = false;
+    return false;
+  }
+  time_t now = time(nullptr);
+  if (now <= 0) return false;
+  outSec = (int)(now % 86400);
+  return true;
+}
+
+// Operational window boundaries come from the NVS config (formerly the WAKE_/
+// NAP_ compile-time macros, now the defaults). g_sleepGeo is loaded before any
+// scheduling decision (loadSleepGeoFromNvs runs early in setup).
+static int cfgWakeSec(void) { return g_sleepGeo.wake_hour * 3600 + g_sleepGeo.wake_minute * 60; }
+static int cfgNapSec(void)  { return g_sleepGeo.nap_hour  * 3600 + g_sleepGeo.nap_minute  * 60; }
+
 /** True when localSecOfDay falls inside the WAKE→NAP active window. */
 static bool isInsideOperationalWindow(int localSecOfDay) {
-  const int wakeSec = WAKE_HOUR * 3600 + WAKE_MINUTE * 60;
-  const int napSec  = NAP_HOUR  * 3600 + NAP_MINUTE  * 60;
+  const int wakeSec = cfgWakeSec();
+  const int napSec  = cfgNapSec();
   if (wakeSec == napSec) return true;
   if (wakeSec < napSec)
     return (localSecOfDay >= wakeSec && localSecOfDay < napSec);
@@ -1771,7 +2182,7 @@ static bool isInsideOperationalWindow(int localSecOfDay) {
 
 /** Seconds from localSecOfDay until the next WAKE boundary. */
 static int secondsUntilNextWake(int localSecOfDay) {
-  const int wakeSec = WAKE_HOUR * 3600 + WAKE_MINUTE * 60;
+  const int wakeSec = cfgWakeSec();
   if (localSecOfDay < wakeSec)
     return wakeSec - localSecOfDay;
   return 86400 - localSecOfDay + wakeSec;
@@ -1779,7 +2190,7 @@ static int secondsUntilNextWake(int localSecOfDay) {
 
 /** Seconds from localSecOfDay until the next NAP boundary. */
 static int secondsUntilNextNap(int localSecOfDay) {
-  const int napSec = NAP_HOUR * 3600 + NAP_MINUTE * 60;
+  const int napSec = cfgNapSec();
   if (localSecOfDay < napSec)
     return napSec - localSecOfDay;
   return 86400 - localSecOfDay + napSec;
@@ -1890,6 +2301,8 @@ static void prepareModuleForPSM(void) {
   sendATCommand("AT+QICLOSE=1", 500);
   sendATCommand("AT+QICLOSE=2", 500);
   delay(300);
+  // eDRX keeps the RF front-end on a paging cycle and fights PSM for minimum sleep.
+  sendATCommand("AT+CEDRXS=0,5", 1000);
   String psmStatus = sendATCommand("AT+CPSMS?", 1000);
   if (psmStatus.indexOf("1,") == -1 && psmStatus.indexOf(": 1") == -1) {
     String psmCmd = String("AT+CPSMS=1,,,\"") + PSM_PERIODIC_TAU + "\",\"" + PSM_ACTIVE_TIME + "\"";
@@ -1899,7 +2312,8 @@ static void prepareModuleForPSM(void) {
   if (sclkStatus.indexOf("1") == -1) {
     sendATCommand("AT+QSCLK=1", 500);
   }
-  oled_status("PSM ready", "3.3uA", -1);
+  modemFlushInput(50);
+  oled_status("PSM ready", "", -1);
 }
 
 static void wakeModuleFromPSM(void) {
@@ -1927,6 +2341,52 @@ static void wakeModuleFromPSM(void) {
   if (ceregCheck.indexOf(",1") != -1 || ceregCheck.indexOf(",5") != -1) {
     Serial.println("Network registration preserved after PSM");
   }
+}
+
+// Probe whether the modem answers "AT" at the currently-open UART baud.
+static bool modemRespondsAT(void) {
+  modemFlushInput(20);
+  for (int i = 0; i < 3; i++) {
+    String r = sendATCommand("AT", 400);
+    if (r.indexOf("OK") != -1) return true;
+    delay(80);
+  }
+  return false;
+}
+
+// Raise the modem UART from the fallback baud to BC95_BAUD. The AT+IPR reply
+// comes back at the OLD baud, so we re-open the ESP UART at the target after.
+static void raiseModemBaudToTarget(void) {
+#if BC95_BAUD != BC95_BAUD_FALLBACK
+  Serial.printf("[BAUD] raising modem UART %d -> %d\n", (int)BC95_BAUD_FALLBACK, (int)BC95_BAUD);
+  sendATCommand(String("AT+IPR=") + String((unsigned long)BC95_BAUD), 800);
+  sendATCommand("AT&W", 600);   // persist across power cycles (harmless if unsupported)
+  delay(150);
+  bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+  delay(80);
+  modemFlushInput(40);
+  if (modemRespondsAT()) Serial.printf("[BAUD] modem now at %d\n", (int)BC95_BAUD);
+  else Serial.printf("[BAUD] WARN: no OK at %d after AT+IPR\n", (int)BC95_BAUD);
+#endif
+}
+
+// Cold-boot bring-up: open at the target baud and wait for the module to boot.
+// If it never answers at the target, fall back to the fallback baud (fresh
+// module / post-AT&F0) and migrate it to the target. Leaves the UART open at
+// whichever baud the modem actually responded on.
+static bool modemBootAndSetBaud(int maxAttempts, int delayMs) {
+  bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+  if (waitForModuleBoot(maxAttempts, delayMs)) return true;
+#if BC95_BAUD != BC95_BAUD_FALLBACK
+  Serial.printf("[BAUD] no reply at %d, trying fallback %d...\n",
+                (int)BC95_BAUD, (int)BC95_BAUD_FALLBACK);
+  bc95_modem.begin(BC95_BAUD_FALLBACK, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+  if (waitForModuleBoot(maxAttempts, delayMs)) {
+    raiseModemBaudToTarget();
+    return true;
+  }
+#endif
+  return false;
 }
 
 // Parse the <stat> field from a CEREG response. Handles both URC form
@@ -2035,14 +2495,37 @@ static void initializeModule(void) {
   oled_status("init module", "start", -1);
   sendATCommand("AT+CMEE=2", 500);
 
-  Serial.println("Rebooting module...");
-  oled_status("module reboot", "wait", -1);
+#if BC95_FACTORY_RESET_ON_PROVISION
+  // Opt-in clean slate. NOTE: AT&F0 wipes the persisted baud and APN, so the next cold boot
+  // pays the 9600 fallback again and re-provisions. Only enable to recover a bad module.
+  Serial.println("Factory reset (AT&F0)...");
+  oled_status("module reset", "AT&F0", -1);
   sendATCommand("AT&F0", 1000);
+#endif
+  // Persist the target baud to the modem NV so future cold boots come straight up at
+  // BC95_BAUD with no 9600 fallback. (raiseModemBaudToTarget also does this on first sync.)
+#if BC95_BAUD != BC95_BAUD_FALLBACK
+  sendATCommand(String("AT+IPR=") + String((unsigned long)BC95_BAUD), 800);
+#endif
   Serial.println("Configuring APN (sensor.net)..."); //simky od Honzy sensor.net; moje simky iot.1nce.net
   sendATCommand("AT+QCGDEFCONT=\"IP\",\"sensor.net\"", 2000);
+  sendATCommand("AT&W", 600);   // persist baud + APN + base config across power cycles/reboot
+  Serial.println("Rebooting module (AT+NRB) to apply APN...");
+  oled_status("module reboot", "wait", -1);
   sendATCommand("AT+NRB", 1000);
   Serial.println("Waiting for module reboot...");
   delay(4000);
+#if BC95_BAUD != BC95_BAUD_FALLBACK
+  // After NRB the module reboots at its persisted baud (BC95_BAUD if AT&W stuck). If a module
+  // never persisted it (or a factory reset above wiped it), it comes back at the fallback —
+  // re-sync and re-persist so the rest of init talks at the right rate.
+  if (!modemRespondsAT()) {
+    bc95_modem.begin(BC95_BAUD_FALLBACK, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+    delay(40);
+    if (modemRespondsAT()) raiseModemBaudToTarget();
+    else bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+  }
+#endif
   sendATCommand("AT", 500);
   sendATCommand("ATE0", 500);
   sendATCommand("AT+QSCLK=0", 500);
@@ -2250,43 +2733,79 @@ static int daytimeFallbackSleepSeconds(void) {
 // If modem time says we are outside the daytime window, take one long deep sleep
 // until the next WAKE boundary. No camera warm-up, GNSS, or ML on this wake —
 // avoids repeated timer wakes at DEFAULT_SLEEP_TIME that only re-check the clock.
-static void tryScheduleNightSleepIfOutsideWindow(void) {
+/** Ask the modem for CCLK and convert to local second-of-day. Returns -1 when
+ *  the modem has no usable time (not registered yet / invalid CCLK). */
+static int gateTimeFromModem(void) {
   int gateHour = -1, gateMin = -1;
   String gateRaw;
-  if (!queryNetworkTime(gateHour, gateMin, gateRaw)) {
-    Serial.println("[SCHED] Network time unavailable — full init (camera + ML).");
-    return;
-  }
+  if (!queryNetworkTime(gateHour, gateMin, gateRaw)) return -1;
   int q1 = gateRaw.indexOf('"');
   int q2 = (q1 >= 0) ? gateRaw.indexOf('"', q1 + 1) : -1;
   String payload = (q1 >= 0 && q2 > q1) ? gateRaw.substring(q1, q2 + 1) : "";
   NetworkTime nt;
   if (!parseNetworkTimeFull(payload, nt)) {
-    Serial.printf("[SCHED] CCLK time invalid (%s). Full init.\n", gateRaw.c_str());
-    return;
+    Serial.printf("[SCHED] CCLK time invalid (%s).\n", gateRaw.c_str());
+    return -1;
   }
   int localSec = resolveLocalSecondOfDay(nt);
+  Serial.printf("[SCHED] Local time: %02d:%02d (TZ: %s%+d qh)\n",
+                localSec / 3600, (localSec % 3600) / 60,
+                nt.hasTz ? "modem " : "fallback ",
+                nt.hasTz ? nt.tzQuarterHours : fallbackTzQuarterHours(nt));
+  return localSec;
+}
+
+static void tryScheduleNightSleepIfOutsideWindow(void) {
+  // Resolve the local hour from the cheapest trustworthy source. Previously this
+  // gave up when the modem had no time yet (always the case on a cold boot,
+  // because registration happens later) and ran a FULL camera+ML+upload job at
+  // any hour — silently defeating the configured wake/nap window.
+  int localSec = gateTimeFromModem();
+  const char* src = "modem";
+
+  if (localSec < 0 && rtcLocalSecondOfDay(localSec)) {
+    // Clock seeded on an earlier wake and kept by the RTC through deep sleep.
+    src = "rtc";
+    // (no radio used on this path)
+    Serial.printf("[SCHED] Local time %02d:%02d (persisted RTC clock, no radio)\n",
+                  localSec / 3600, (localSec % 3600) / 60);
+  }
+
+  if (localSec < 0) {
+    // Cold boot with no clock anywhere. Bring the modem up and ask again: every
+    // non-night wake path needs the modem anyway (upload or settings poll), so
+    // this costs nothing during the day — the later initializeModule() call is
+    // then a no-op — and at night it saves a whole camera+GNSS+ML cycle.
+    Serial.println("[SCHED] No clock yet — registering modem to resolve the hour…");
+    initializeModule();
+    localSec = gateTimeFromModem();
+    src = "modem(cold)";
+  }
+
+  if (localSec < 0) {
+    Serial.println("[SCHED] Time still unknown — full init (camera + ML).");
+    return;
+  }
+
+  persistLocalClock(localSec);           // survives deep sleep for later wakes
   g_localSecOfDay = localSec;            // for daytime "sleep until NAP" fallback
   g_localTimeCapturedMs = millis();
   int lh = localSec / 3600;
   int lm = (localSec % 3600) / 60;
   oledStatus.networkHour = lh;          // seed OLED clock early so it's never blank
   oledStatus.networkMinute = lm;
-  Serial.printf("[SCHED] Local time: %02d:%02d (TZ: %s%+d qh)\n",
-                lh, lm,
-                nt.hasTz ? "modem " : "fallback ",
-                nt.hasTz ? nt.tzQuarterHours : FALLBACK_TZ_QUARTER_HOURS);
 
   if (isInsideOperationalWindow(localSec)) {
-    Serial.printf("[SCHED] Inside window (%02d:%02d-%02d:%02d). Proceeding.\n",
-                  WAKE_HOUR, WAKE_MINUTE, NAP_HOUR, NAP_MINUTE);
+    Serial.printf("[SCHED] Inside window (%02u:%02u-%02u:%02u) [%s]. Proceeding.\n",
+                  g_sleepGeo.wake_hour, g_sleepGeo.wake_minute,
+                  g_sleepGeo.nap_hour, g_sleepGeo.nap_minute, src);
     return;
   }
 
   int sleepSec = secondsUntilNextWake(localSec);
   sleepSec = clampSleepSeconds(sleepSec);
-  Serial.printf("[SCHED] Night — single %ds deep sleep until next WAKE (no camera/GNSS/ML this wake).\n",
-                sleepSec);
+  Serial.printf("[SCHED] Night [%s] — single %ds deep sleep until next WAKE (no camera/GNSS/ML this wake).\n",
+                src, sleepSec);
   s_sleepOledExtra[0] = '\0';
   customSleepDuration = sleepSec;
   enterNightScheduleSleepMode();
@@ -2299,6 +2818,14 @@ static void sleepGeoApplyDefaults(SleepGeoConfig& c) {
   c.home_radius_m = 1000;
   c.sleep_home_s = 1800;
   c.sleep_away_s = 600;
+  // Operational window + PIR modes default to the previous compile-time
+  // behaviour (wake 07:00, nap 20:00, PIR armed in both daytime states).
+  c.wake_hour = WAKE_HOUR;
+  c.wake_minute = WAKE_MINUTE;
+  c.nap_hour = NAP_HOUR;
+  c.nap_minute = NAP_MINUTE;
+  c.pir_home_mode = PIR_MODE_PIR_TIMER;
+  c.pir_away_mode = PIR_MODE_PIR_TIMER;
 }
 
 static void loadSleepGeoFromNvs(void) {
@@ -2318,10 +2845,12 @@ static void loadSleepGeoFromNvs(void) {
     return;
   }
   g_sleepGeo = tmp;
-  Serial.printf("[SLEEP_GEO] Loaded: r=%lum home=%lus away=%lus lat=%.6f lon=%.6f\n",
+  Serial.printf("[SLEEP_GEO] Loaded: r=%lum home=%lus away=%lus lat=%.6f lon=%.6f win=%02u:%02u-%02u:%02u pir(home=%u,away=%u)\n",
                 (unsigned long)g_sleepGeo.home_radius_m,
                 (unsigned long)g_sleepGeo.sleep_home_s, (unsigned long)g_sleepGeo.sleep_away_s,
-                g_sleepGeo.home_lat, g_sleepGeo.home_lon);
+                g_sleepGeo.home_lat, g_sleepGeo.home_lon,
+                g_sleepGeo.wake_hour, g_sleepGeo.wake_minute, g_sleepGeo.nap_hour, g_sleepGeo.nap_minute,
+                g_sleepGeo.pir_home_mode, g_sleepGeo.pir_away_mode);
 }
 
 static bool saveSleepGeoToNvs(const SleepGeoConfig& c) {
@@ -2358,21 +2887,50 @@ static double haversineMeters(double lat1, double lon1, double lat2, double lon2
   return kEarthRadiusM * c;
 }
 
-/** Set customSleepDuration for daytime deep sleep. PIR is the primary wake source;
- *  the timer only bridges to the NAP boundary (day->night). Not for night window. */
+/** Configure customSleepDuration + s_daytimePirArm for a geofence state (home or
+ *  away) from that state's pir mode and sleep interval:
+ *    PIR+timer  -> wake on motion OR after sleep_X_s (clamped to the NAP boundary)
+ *    timer-only -> wake only after sleep_X_s (clamped to NAP), PIR disarmed
+ *    PIR-only   -> wake only on motion; timer = PIR_ONLY_SAFETY_S (clamped to NAP)
+ *  The NAP clamp guarantees the device never sleeps past the day->night boundary. */
+static void configureDaytimeSleepForState(bool isHome) {
+  const uint8_t mode = isHome ? g_sleepGeo.pir_home_mode : g_sleepGeo.pir_away_mode;
+  const uint32_t interval = isHome ? g_sleepGeo.sleep_home_s : g_sleepGeo.sleep_away_s;
+  const int untilNap = daytimeFallbackSleepSeconds();
+  const char* tag;
+  if (mode == PIR_MODE_PIR_ONLY) {
+    int t = clampSleepSeconds((int)PIR_ONLY_SAFETY_S);
+    customSleepDuration = (t < untilNap) ? t : untilNap;
+    s_daytimePirArm = true;
+    tag = isHome ? "home PIRonly" : "away PIRonly";
+  } else {
+    int t = clampSleepSeconds((int)interval);
+    customSleepDuration = (t < untilNap) ? t : untilNap;
+    s_daytimePirArm = (mode == PIR_MODE_PIR_TIMER);
+    tag = (mode == PIR_MODE_PIR_TIMER) ? (isHome ? "home PIR+T" : "away PIR+T")
+                                       : (isHome ? "home timer" : "away timer");
+  }
+  snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "%s", tag);
+  Serial.printf("[SLEEP_GEO] %s -> mode=%u timer=%ds pir=%d\n",
+                isHome ? "home" : "away", mode, customSleepDuration, (int)s_daytimePirArm);
+}
+
+/** Set customSleepDuration for daytime deep sleep, honouring the per-state PIR
+ *  mode + interval. Not for the night window. */
 static void applyDaytimeSleepFromGeofence(void) {
   s_sleepOledExtra[0] = '\0';
   const bool fixOk = (HAS_GNSS != 0) && g_gnssLastFix.valid;
 
   if (g_sleepGeo.home_radius_m == 0) {
-    customSleepDuration = daytimeFallbackSleepSeconds();
-    Serial.printf("[SLEEP_GEO] geo_off -> PIR-driven, timer %ds (until NAP)\n", customSleepDuration);
-    snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "off PIR");
+    // Geofence disabled: no home/away distinction — treat as deployed (away).
+    configureDaytimeSleepForState(false);
     return;
   }
 
   if (!fixOk) {
+    // No GNSS fix: short retry, keep PIR armed so motion can still wake.
     customSleepDuration = clampSleepSeconds((int)GNSS_NO_FIX_RETRY_S);
+    s_daytimePirArm = true;
     Serial.printf("[SLEEP_GEO] no_fix -> retry %ds\n", customSleepDuration);
     snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "no GPS");
     return;
@@ -2380,18 +2938,11 @@ static void applyDaytimeSleepFromGeofence(void) {
 
   double dist = haversineMeters(g_gnssLastFix.lat_deg, g_gnssLastFix.lon_deg,
                                 g_sleepGeo.home_lat, g_sleepGeo.home_lon);
-  customSleepDuration = daytimeFallbackSleepSeconds();
-  if (dist <= (double)g_sleepGeo.home_radius_m) {
-    Serial.printf("[SLEEP_GEO] home (%.1fm) -> PIR-driven, timer %ds (until NAP)\n", dist, customSleepDuration);
-    snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "home PIR");
-  } else {
-    Serial.printf("[SLEEP_GEO] away (%.1fm) -> PIR-driven, timer %ds (until NAP)\n", dist, customSleepDuration);
-    snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "away PIR");
-  }
+  configureDaytimeSleepForState(dist <= (double)g_sleepGeo.home_radius_m);
 }
 
 /** GNSS geofence gate before camera/ML (daytime wakes only; night handled earlier).
- *  In depot → deep sleep with sleep_home_s (no capture/upload).
+ *  In depot → settings-only TCP poll, then deep sleep with sleep_home_s (no capture).
  *  No fix → deep sleep GNSS_NO_FIX_RETRY_S (10 min).
  *  Outside home radius → return and run full observation loop. */
 static void tryEarlyGeofenceSleepRouting(void) {
@@ -2430,6 +2981,7 @@ static void tryEarlyGeofenceSleepRouting(void) {
 
   if (!gotFix || !g_gnssLastFix.valid) {
     customSleepDuration = clampSleepSeconds((int)GNSS_NO_FIX_RETRY_S);
+    s_daytimePirArm = true;   // motion can still wake during the no-fix retry
     Serial.printf("[SLEEP_GEO] early no_fix -> sleep %ds (retry)\n", customSleepDuration);
     snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "no GPS");
     enterDaytimeSleepMode();
@@ -2438,10 +2990,43 @@ static void tryEarlyGeofenceSleepRouting(void) {
   double dist = haversineMeters(g_gnssLastFix.lat_deg, g_gnssLastFix.lon_deg,
                                 g_sleepGeo.home_lat, g_sleepGeo.home_lon);
   if (dist <= (double)g_sleepGeo.home_radius_m) {
-    customSleepDuration = daytimeFallbackSleepSeconds();
-    Serial.printf("[SLEEP_GEO] early home (%.1fm) -> PIR-driven, timer %ds (skip camera/ML)\n",
-                  dist, customSleepDuration);
-    snprintf(s_sleepOledExtra, sizeof(s_sleepOledExtra), "home PIR");
+    Serial.printf("[SLEEP_GEO] early home (%.1fm) skip camera/ML — settings poll\n", dist);
+#if BENCH_SKIP_UPLINK
+    Serial.println("[BENCH] SKIP_UPLINK: skipping depot settings poll");
+#else
+    // OLED was torn down with the GNSS I2C teardown above; restore for status UI.
+    if (s_oled_initialized) {
+      initI2CBusOnce();
+    }
+    (void)pollSettingsOverTCP();
+#if OTA_VIA_SERVER_COMMAND
+    if (g_otaRequested) {
+      g_otaRequested = false;
+      runOtaUpdate();
+    }
+#endif
+#if OTA_CHECK_ON_COLD_BOOT
+    // Cold-boot OTA is normally deferred until after the main job; depot never
+    // reaches that path, so run the check here while the modem is already online.
+    if (g_otaColdBootPending) {
+      g_otaColdBootPending = false;
+      Serial.println("[OTA] depot-path cold-boot update check");
+      runOtaUpdate();
+    }
+#endif
+    // Web-app settings may have moved home / disabled the geofence — re-check.
+    if (g_sleepGeo.home_radius_m == 0) {
+      Serial.println("[SLEEP_GEO] geofence disabled by settings — full observation loop");
+      return;
+    }
+    dist = haversineMeters(g_gnssLastFix.lat_deg, g_gnssLastFix.lon_deg,
+                           g_sleepGeo.home_lat, g_sleepGeo.home_lon);
+    if (dist > (double)g_sleepGeo.home_radius_m) {
+      Serial.printf("[SLEEP_GEO] outside after settings (%.1fm) — full observation loop\n", dist);
+      return;
+    }
+#endif
+    configureDaytimeSleepForState(true);   // in-depot: use (possibly updated) home interval
     enterDaytimeSleepMode();
   }
 
@@ -2535,6 +3120,13 @@ static bool receiveFromTCP(int connectID, String& outData, unsigned long timeout
   return false;
 }
 
+// Set by the set_config command branch when the config was applied AND saved
+// to NVS. sendPhotoOverTCP / pollSettingsOverTCP write a "CFG_APPLIED\n" ack
+// back on the socket so the server only clears the pending config on real,
+// confirmed delivery (a lost reply keeps it pending → automatically re-sent
+// next cycle).
+static bool g_cfgAppliedAck = false;
+
 // Parse JSON command from server and apply it
 static void parseAndApplyCommand(const String& jsonData) {
   JsonDocument doc;
@@ -2586,15 +3178,499 @@ static void parseAndApplyCommand(const String& jsonData) {
       oled_status("CMD", "sleep_geo NVS", -1);
     }
     delay(2000);
+  } else if (strcmp(cmd, "set_config") == 0) {
+    // Unified config push from /app/ device settings. Any subset of fields may
+    // be present; missing fields keep their current value. Ranges clamped here
+    // as a second line of defence (server validates too).
+    SleepGeoConfig next = g_sleepGeo;
+    auto u8clamp = [](long v, long hi) -> uint8_t {
+      if (v < 0) v = 0; if (v > hi) v = hi; return (uint8_t)v;
+    };
+    if (!doc["wake_hour"].isNull())    next.wake_hour   = u8clamp(doc["wake_hour"].as<long>(), 23);
+    if (!doc["wake_minute"].isNull())  next.wake_minute = u8clamp(doc["wake_minute"].as<long>(), 59);
+    if (!doc["nap_hour"].isNull())     next.nap_hour    = u8clamp(doc["nap_hour"].as<long>(), 23);
+    if (!doc["nap_minute"].isNull())   next.nap_minute  = u8clamp(doc["nap_minute"].as<long>(), 59);
+    if (!doc["home_lat"].isNull())     next.home_lat    = doc["home_lat"].as<double>();
+    if (!doc["home_lon"].isNull())     next.home_lon    = doc["home_lon"].as<double>();
+    if (!doc["home_radius_m"].isNull()) {
+      uint32_t r = (uint32_t)doc["home_radius_m"].as<unsigned long>();
+      if (r > 2000000UL) r = 2000000UL;
+      next.home_radius_m = r;
+    }
+    if (!doc["sleep_home_s"].isNull()) next.sleep_home_s = (uint32_t)clampSleepSeconds((int)doc["sleep_home_s"].as<long>());
+    if (!doc["sleep_away_s"].isNull()) next.sleep_away_s = (uint32_t)clampSleepSeconds((int)doc["sleep_away_s"].as<long>());
+    if (!doc["pir_home_mode"].isNull()) next.pir_home_mode = u8clamp(doc["pir_home_mode"].as<long>(), 2);
+    if (!doc["pir_away_mode"].isNull()) next.pir_away_mode = u8clamp(doc["pir_away_mode"].as<long>(), 2);
+
+    if (saveSleepGeoToNvs(next)) {
+      g_sleepGeo = next;  // apply in RAM immediately (also persisted for next boot)
+      g_cfgAppliedAck = true;   // confirm delivery to the server on this socket
+      Serial.printf("Command: set_config applied win=%02u:%02u-%02u:%02u r=%lu home=%lus away=%lus pir(%u,%u) lat=%.6f lon=%.6f\n",
+                    g_sleepGeo.wake_hour, g_sleepGeo.wake_minute, g_sleepGeo.nap_hour, g_sleepGeo.nap_minute,
+                    (unsigned long)g_sleepGeo.home_radius_m,
+                    (unsigned long)g_sleepGeo.sleep_home_s, (unsigned long)g_sleepGeo.sleep_away_s,
+                    g_sleepGeo.pir_home_mode, g_sleepGeo.pir_away_mode,
+                    g_sleepGeo.home_lat, g_sleepGeo.home_lon);
+      oled_status("CMD", "config OK", -1);
+    } else {
+      Serial.println("Command: set_config NVS save failed");
+      oled_status("CMD", "config NVS", -1);
+    }
+    delay(2000);
   } else if (strcmp(cmd, "ack") == 0) {
     Serial.println("Command: ack (no change)");
     oled_status("CMD Received", "ACK", -1);
+    delay(1000);
+  } else if (strcmp(cmd, "ota") == 0) {
+    // Defer the actual update until the telemetry socket is closed (runMainJob).
+    g_otaRequested = true;
+    Serial.println("Command: ota (deferred to end of cycle)");
+    oled_status("CMD Received", "OTA queued", -1);
     delay(1000);
   } else {
     Serial.printf("Unknown command: %s\n", cmd);
     oled_status("CMD Unknown", cmd, -1);
     delay(1000);
   }
+}
+
+/** Wait for a server JSON command on an open TCP socket and apply it.
+ *  On set_config success, sends CFG_APPLIED so the server clears pending state. */
+static void applyTcpServerReply(int connectID) {
+#if TCP_WAIT_FOR_SERVER_RESPONSE
+  oled_status("Waiting for", "server...", -1);
+  String serverResponse;
+  if (receiveFromTCP(connectID, serverResponse, TCP_RECV_TIMEOUT_MS)) {
+    Serial.println("Server response: " + serverResponse);
+    parseAndApplyCommand(serverResponse);
+    if (g_cfgAppliedAck) {
+      g_cfgAppliedAck = false;
+      static const char kAck[] = "CFG_APPLIED\n";
+      if (sendBinaryOverTCP(connectID, (const uint8_t*)kAck, sizeof(kAck) - 1, 5000, 10000)) {
+        Serial.println("CFG_APPLIED ack sent");
+      } else {
+        Serial.println("CFG_APPLIED ack send failed (config stays pending server-side)");
+      }
+      delay(300);
+    }
+  } else {
+    Serial.println("No response from server (timeout)");
+    oled_status("No server", "response", -1);
+    delay(1000);
+  }
+#else
+  (void)connectID;
+  Serial.println("TCP: skip wait for server response (TCP_WAIT_FOR_SERVER_RESPONSE=0)");
+#endif
+}
+
+/** Depot-path settings poll: open telemetry TCP, announce device with image_size:0
+ *  (no photo / no line-protocol telemetry), then apply any pending web-app config.
+ *  Server must accept a zero-byte image upload and still push set_config. */
+static bool pollSettingsOverTCP(void) {
+  Serial.println("[CFG] settings-only poll starting...");
+  oled_status("Settings", "check...", 0);
+  generateMeasurementId();
+
+  if (!moduleInitialized) {
+    oled_status("Settings", "modem...", 0);
+    initializeModule();
+  }
+  if (!moduleInitialized) {
+    Serial.println("[CFG] modem not ready — skip settings poll");
+    oled_status("Settings", "modem fail", -1);
+    delay(1000);
+    return false;
+  }
+
+  int contextID = 1;
+  int connectID = 0;
+  // Buffer access mode (0): same as photo path — replies are read via AT+QIRD.
+  int accessMode = 0;
+  String openCmd = String("AT+QIOPEN=") + String(contextID) + "," + String(connectID) +
+                   ",\"TCP\",\"" + SERVER_IP + "\"," + String(TCP_PORT) + ",0," + String(accessMode);
+  String response = sendATCommand(openCmd, 10000);
+  if (response.indexOf("OK") == -1) {
+    Serial.println("[CFG] QIOPEN issue failed");
+    oled_status("Settings", "TCP OPEN ERR", -1);
+    return false;
+  }
+  if (!waitForQIOPEN(connectID, 60000, response)) {
+    Serial.println("[CFG] QIOPEN timeout");
+    oled_status("Settings", "TCP TIMEOUT", -1);
+    return false;
+  }
+  Serial.println("[CFG] TCP connected — sending settings-only header");
+  oled_status("Settings", "polling...", 20);
+
+  String header = "CORRELATION_HEADER\n";
+  header += "app:container-classifier\n";
+  header += "device_id:" + String((unsigned long long)device_id, HEX) + "\n";
+  header += "measurement_id:" + String(measurement_id) + "\n";
+  header += "timestamp:" + String(millis()) + "\n";
+  header += "image_size:0\n";
+  header += "settings_only:1\n";
+  header += "END_HEADER\n";
+  if (!sendBinaryOverTCP(connectID, (const uint8_t*)header.c_str(), header.length(), 5000, 10000)) {
+    Serial.println("[CFG] header SEND FAIL");
+    oled_status("Settings", "SEND FAIL", -1);
+    sendATCommand("AT+QICLOSE=" + String(connectID), 3000);
+    return false;
+  }
+
+  applyTcpServerReply(connectID);
+
+  sendATCommand("AT+QICLOSE=" + String(connectID), 3000);
+  oled_status("Settings", "done", 100);
+  Serial.println("[CFG] settings-only poll complete");
+  return true;
+}
+
+// ============================================================================
+// OTA over NB-IoT (raw TCP, length-framed)
+// ----------------------------------------------------------------------------
+// Reuses the Quectel "QI" TCP/IP stack already used for telemetry. The device
+// opens a socket to the OTA server, sends one request line, and the server
+// replies with either:
+//     OTA_NONE\n                                  (already up to date)
+//   or
+//     OTA_BEGIN size=<bytes> ver=<n> md5=<hex>\n   followed by exactly <bytes>
+//                                                  of the raw firmware .bin
+// The body is streamed straight into the inactive OTA slot via esp_ota_*,
+// MD5-verified end-to-end, then the device reboots into the new image. The
+// ESP32 bootloader validates the image (magic/checksum) on esp_ota_end(), so a
+// truncated or corrupt download can never brick the device — it just keeps
+// running the current slot.
+// ============================================================================
+
+// Small framed reader over AT+QIRD (socket opened in buffer access mode).
+struct OtaSock {
+  int id;
+  uint8_t rx[1200];
+  int rxLen;
+  int rxPos;
+};
+
+static void otaCloseSocket(int connectID) {
+  sendATCommand("AT+QICLOSE=" + String(connectID), 3000);
+}
+
+// Read up to maxLen bytes from a TCP socket via AT+QIRD. Binary-safe: parses the
+// ASCII "+QIRD: <len>\r\n" header, then reads exactly <len> raw bytes straight
+// from the UART (NOT through Arduino String, which truncates on embedded 0x00).
+// Returns byte count, 0 if nothing buffered yet, -1 on modem error.
+static int qirdReadBytes(int connectID, uint8_t* buf, size_t maxLen, unsigned long timeoutMs) {
+  modemFlushInput(5);
+  String readCmd = String("AT+QIRD=") + String(connectID) + "," + String((unsigned)maxLen);
+  bc95_modem.print(readCmd + "\r\n");
+
+  // Phase 1: read the ASCII header line "+QIRD: <len>" (ends at its '\n').
+  String hdr;
+  hdr.reserve(48);
+  long n = -1;
+  bool haveLen = false;
+  unsigned long start = millis();
+  while (!haveLen && (millis() - start) < timeoutMs) {
+    while (bc95_modem.available()) {
+      char c = (char)bc95_modem.read();
+      hdr += c;
+      if (hdr.indexOf("+CME ERROR") != -1) return -1;
+      if (hdr.indexOf("\r\nERROR") != -1 && hdr.indexOf("+QIRD:") == -1) return -1;
+      int p = hdr.indexOf("+QIRD:");
+      if (p != -1) {
+        int nl = hdr.indexOf('\n', p);
+        if (nl != -1) {
+          String ls = hdr.substring(p + 6, nl);
+          ls.trim();
+          n = ls.toInt();
+          haveLen = true;
+          break;
+        }
+      }
+    }
+    if (!haveLen) delay(2);
+  }
+  if (!haveLen) return 0;          // modem slow / no URC yet — caller retries
+  if (n <= 0) {
+    modemFlushInput(20);           // "+QIRD: 0" -> swallow trailing OK
+    return 0;
+  }
+  if (n > (long)maxLen) n = (long)maxLen;
+
+  // Phase 2: read exactly n raw payload bytes (may contain CR/LF/NUL).
+  int got = 0;
+  unsigned long bstart = millis();
+  while (got < n && (millis() - bstart) < (timeoutMs + 8000)) {
+    while (bc95_modem.available() && got < n) {
+      buf[got++] = (uint8_t)bc95_modem.read();
+    }
+    if (got < n) delay(2);
+  }
+  modemFlushInput(30);             // swallow trailing \r\nOK\r\n
+  return got;
+}
+
+// Block until exactly n bytes are read (across multiple QIRD batches) or the
+// overall budget expires. NB-IoT delivers in slow bursts, so an empty QIRD
+// (+QIRD: 0) or a transient ERROR is normal — keep polling until the budget,
+// don't abort the whole multi-minute download on a single hiccup.
+static bool otaReadExact(OtaSock& s, uint8_t* dst, int n, unsigned long overallMs) {
+  unsigned long start = millis();
+  int got = 0;
+  while (got < n) {
+    if (s.rxPos >= s.rxLen) {
+      int r = qirdReadBytes(s.id, s.rx, OTA_QIRD_READ_LEN, 8000);
+      if (r > 0) {
+        s.rxLen = r;
+        s.rxPos = 0;
+      } else {
+        s.rxLen = 0;
+        s.rxPos = 0;
+        if (millis() - start > overallMs) return false;  // nothing for too long
+        delay(OTA_RX_POLL_MS);
+        continue;
+      }
+    }
+    int avail = s.rxLen - s.rxPos;
+    int take = (n - got < avail) ? (n - got) : avail;
+    memcpy(dst + got, s.rx + s.rxPos, take);
+    s.rxPos += take;
+    got += take;
+  }
+  return true;
+}
+
+// Read the single ASCII header line (OTA_BEGIN / OTA_NONE) terminated by '\n',
+// using the same binary-safe QIRD reader as the firmware download. Crucially,
+// any bytes AFTER the '\n' (the first firmware bytes, which can arrive in the
+// same QIRD batch as the header) are left in s.rx at s.rxPos so otaReadExact()
+// consumes them next — no byte is lost or duplicated at the ASCII↔binary seam.
+// Using a String here for the binary tail (the old approach) corrupted the seam:
+// it truncated on 0x00 and leaked the framing '\r' as the first written byte
+// ("invalid magic byte ... saw 0x0d").
+static bool otaReadHeaderLine(int connectID, OtaSock& s, String& line, unsigned long overallMs) {
+  line = "";
+  s.rxLen = 0;
+  s.rxPos = 0;
+  unsigned long start = millis();
+  for (;;) {
+    if (s.rxPos >= s.rxLen) {
+      int r = qirdReadBytes(connectID, s.rx, OTA_QIRD_READ_LEN, 8000);
+      if (r > 0) {
+        s.rxLen = r;
+        s.rxPos = 0;
+      } else {
+        s.rxLen = 0;
+        s.rxPos = 0;
+        if (millis() - start > overallMs) return false;
+        delay(OTA_RX_POLL_MS);
+        continue;
+      }
+    }
+    while (s.rxPos < s.rxLen) {
+      char c = (char)s.rx[s.rxPos++];
+      if (c == '\n') {            // s.rxPos now points at the first firmware byte
+        line.trim();
+        return line.length() > 0;
+      }
+      if (c != '\r') line += c;
+      if (line.length() > 200) return false;  // runaway guard
+    }
+  }
+}
+
+static long otaParseToken(const String& src, const char* key, long fallback) {
+  int p = src.indexOf(key);
+  if (p == -1) return fallback;
+  p += strlen(key);
+  int end = p;
+  while (end < (int)src.length() && src[end] != ' ' && src[end] != '\r' && src[end] != '\n') end++;
+  return src.substring(p, end).toInt();
+}
+
+static String otaParseStr(const String& src, const char* key) {
+  int p = src.indexOf(key);
+  if (p == -1) return String("");
+  p += strlen(key);
+  int end = p;
+  while (end < (int)src.length() && src[end] != ' ' && src[end] != '\r' && src[end] != '\n') end++;
+  return src.substring(p, end);
+}
+
+// Returns true only when an update was applied (in which case it reboots and
+// never returns). Returns false for "no update" or any failure (caller keeps
+// running the current firmware normally).
+static bool runOtaUpdate(void) {
+  Serial.printf("[OTA] check start (running fw v%d)\n", (int)FW_VERSION);
+  oled_status("OTA", "checking...", -1);
+
+  if (!moduleInitialized) initializeModule();
+  if (!moduleInitialized) {
+    Serial.println("[OTA] modem not registered, skip");
+    return false;
+  }
+
+  const int contextID = 1;
+  const int connectID = 0;
+  const int accessMode = 0;  // buffer access mode -> AT+QIRD retrieves received bytes
+  String openCmd = String("AT+QIOPEN=") + String(contextID) + "," + String(connectID) +
+                   ",\"TCP\",\"" + OTA_SERVER_IP + "\"," + String(OTA_TCP_PORT) + ",0," + String(accessMode);
+  String resp = sendATCommand(openCmd, 10000);
+  if (resp.indexOf("OK") == -1) {
+    Serial.println("[OTA] QIOPEN issue failed");
+    return false;
+  }
+  if (!waitForQIOPEN(connectID, 60000, resp)) {
+    Serial.println("[OTA] QIOPEN timeout");
+    otaCloseSocket(connectID);
+    return false;
+  }
+
+  OtaSock s;
+  s.id = connectID;
+  s.rxLen = 0;
+  s.rxPos = 0;
+
+  String req = String("OTA_CHECK device_id=") + String((unsigned long long)device_id, HEX) +
+               " ver=" + String((int)FW_VERSION) + "\n";
+  if (!sendBinaryOverTCP(connectID, (const uint8_t*)req.c_str(), req.length(), 5000, 10000)) {
+    Serial.println("[OTA] request send failed");
+    otaCloseSocket(connectID);
+    return false;
+  }
+  delay(2000);  // let SEND OK finish and server begin reply (NB-IoT RTT)
+
+  String header;
+  if (!otaReadHeaderLine(connectID, s, header, 60000)) {
+    Serial.println("[OTA] no header from server");
+    otaCloseSocket(connectID);
+    return false;
+  }
+  Serial.println("[OTA] server: " + header);
+
+  if (header.startsWith("OTA_NONE")) {
+    Serial.println("[OTA] up to date");
+    oled_status("OTA", "up to date", -1);
+    otaCloseSocket(connectID);
+    return false;
+  }
+  if (!header.startsWith("OTA_BEGIN")) {
+    Serial.println("[OTA] unexpected header");
+    otaCloseSocket(connectID);
+    return false;
+  }
+
+  long newSize = otaParseToken(header, "size=", 0);
+  long newVer = otaParseToken(header, "ver=", 0);
+  String md5hex = otaParseStr(header, "md5=");
+  md5hex.toLowerCase();
+  Serial.printf("[OTA] update available: size=%ld ver=%ld md5=%s\n", newSize, newVer, md5hex.c_str());
+  if (newSize <= 0) {
+    otaCloseSocket(connectID);
+    return false;
+  }
+
+  const esp_partition_t* update = esp_ota_get_next_update_partition(NULL);
+  if (update == NULL) {
+    Serial.println("[OTA] no OTA partition (flash a build with the OTA partition table first)");
+    oled_status("OTA", "no ota part", -1);
+    otaCloseSocket(connectID);
+    return false;
+  }
+  if (newSize > (long)update->size) {
+    Serial.printf("[OTA] image (%ld) larger than slot (%u)\n", newSize, (unsigned)update->size);
+    otaCloseSocket(connectID);
+    return false;
+  }
+  Serial.printf("[OTA] writing to partition '%s' @0x%x\n", update->label, (unsigned)update->address);
+
+  esp_ota_handle_t otaHandle = 0;
+  esp_err_t err = esp_ota_begin(update, newSize, &otaHandle);
+  if (err != ESP_OK) {
+    Serial.printf("[OTA] esp_ota_begin failed: %s\n", esp_err_to_name(err));
+    otaCloseSocket(connectID);
+    return false;
+  }
+
+  md5_context_t md5ctx;
+  esp_rom_md5_init(&md5ctx);
+
+  static uint8_t dlbuf[512];
+  long received = 0;
+  unsigned long lastLog = millis();
+  unsigned long dlStart = millis();
+  bool ok = true;
+  while (received < newSize) {
+    if (millis() - dlStart > OTA_DOWNLOAD_BUDGET_MS) {
+      Serial.println("[OTA] aborted: download budget exceeded");
+      ok = false;
+      break;
+    }
+    int want = (newSize - received < (long)sizeof(dlbuf)) ? (int)(newSize - received) : (int)sizeof(dlbuf);
+    if (!otaReadExact(s, dlbuf, want, OTA_READ_CHUNK_TIMEOUT_MS)) {
+      Serial.printf("[OTA] download stalled at %ld/%ld\n", received, newSize);
+      ok = false;
+      break;
+    }
+    if (esp_ota_write(otaHandle, dlbuf, want) != ESP_OK) {
+      Serial.println("[OTA] esp_ota_write failed");
+      ok = false;
+      break;
+    }
+    esp_rom_md5_update(&md5ctx, dlbuf, want);
+    received += want;
+    if (millis() - lastLog > 3000) {
+      lastLog = millis();
+      int pct = (int)(received * 100 / newSize);
+      Serial.printf("[OTA] %ld/%ld (%d%%)\n", received, newSize, pct);
+      char m[20];
+      snprintf(m, sizeof(m), "%d%% %ldk", pct, received / 1024);
+      oled_status("OTA dl", m, pct);
+    }
+  }
+
+  unsigned char digest[16];
+  esp_rom_md5_final(digest, &md5ctx);
+  otaCloseSocket(connectID);
+
+  if (!ok) {
+    esp_ota_abort(otaHandle);
+    oled_status("OTA", "dl failed", -1);
+    return false;
+  }
+
+  String gotMd5;
+  char hx[3];
+  for (int i = 0; i < 16; i++) {
+    snprintf(hx, sizeof(hx), "%02x", digest[i]);
+    gotMd5 += hx;
+  }
+  if (md5hex.length() == 32 && gotMd5 != md5hex) {
+    Serial.println("[OTA] MD5 mismatch got=" + gotMd5 + " exp=" + md5hex);
+    esp_ota_abort(otaHandle);
+    oled_status("OTA", "MD5 FAIL", -1);
+    return false;
+  }
+
+  err = esp_ota_end(otaHandle);
+  if (err != ESP_OK) {
+    Serial.printf("[OTA] esp_ota_end (image validate) failed: %s\n", esp_err_to_name(err));
+    oled_status("OTA", "img invalid", -1);
+    return false;
+  }
+  err = esp_ota_set_boot_partition(update);
+  if (err != ESP_OK) {
+    Serial.printf("[OTA] set_boot_partition failed: %s\n", esp_err_to_name(err));
+    oled_status("OTA", "setboot fail", -1);
+    return false;
+  }
+
+  Serial.printf("[OTA] SUCCESS: v%d -> v%ld, rebooting into '%s'\n",
+                (int)FW_VERSION, newVer, update->label);
+  oled_status("OTA OK", "reboot", 100);
+  delay(1500);
+  esp_restart();
+  return true;  // unreachable
 }
 
 static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
@@ -2610,7 +3686,11 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
   oled_layout_transmit("Open TCP conn...");
   int contextID = 1;
   int connectID = 0;
-  int accessMode = 1;
+  // Buffer access mode (0): incoming data is held in the modem buffer and read
+  // with AT+QIRD — which is what receiveFromTCP() uses. Mode 1 (direct push)
+  // made the server's set_config reply arrive as an unsolicited URC nothing
+  // was reading, so every reply-wait timed out. (The OTA socket already used 0.)
+  int accessMode = 0;
   String openCmd = String("AT+QIOPEN=") + String(contextID) + "," + String(connectID) +
                    ",\"TCP\",\"" + SERVER_IP + "\"," + String(TCP_PORT) + ",0," + String(accessMode);
   String response = sendATCommand(openCmd, 10000);
@@ -2678,9 +3758,16 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
     snprintf(chunkInfo, sizeof(chunkInfo), "Chunk %d/%d", currentChunk, totalChunks);
     oled_status(imageInfoStr, chunkInfo, chunkPercent);
     offset += thisChunkSize;
-    // Binary mode halves the UART traffic, so inter-chunk pacing can be shorter.
-    if (length - offset < (CHUNK_SIZE * 3)) delay(200);
-    else delay(10);
+    // Inter-chunk pacing. Do NOT shorten this below ~250ms: with fast pacing
+    // (v3 used 10ms) several TCP segments are in flight at once, and under
+    // radio loss the modem's TCP stack has been observed DUPLICATING a block
+    // of payload during retransmission — the server then receives more bytes
+    // than image_size and the JPEG is corrupt mid-stream (no images stored
+    // 2026-06-18 → 07-02). ~250ms lets each segment get radio-acked before
+    // the next is queued, keeping ≤1 segment in flight. Costs ~6s per photo
+    // on a device that sleeps for an hour.
+    if (length - offset < (CHUNK_SIZE * 3)) delay(300);
+    else delay(250);
   }
   delay(500);
 
@@ -2688,21 +3775,7 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
   (void)sendBinaryOverTCP(connectID, END_MARKER, sizeof(END_MARKER), 5000, 10000);
   delay(500);
 
-#if TCP_WAIT_FOR_SERVER_RESPONSE
-  // Wait for server response (bidirectional communication)
-  oled_status("Waiting for", "server...", -1);
-  String serverResponse;
-  if (receiveFromTCP(connectID, serverResponse, TCP_RECV_TIMEOUT_MS)) {
-    Serial.println("Server response: " + serverResponse);
-    parseAndApplyCommand(serverResponse);
-  } else {
-    Serial.println("No response from server (timeout)");
-    oled_status("No server", "response", -1);
-    delay(1000);
-  }
-#else
-  Serial.println("TCP: skip wait for server response (TCP_WAIT_FOR_SERVER_RESPONSE=0)");
-#endif
+  applyTcpServerReply(connectID);
 
   oled_status(imageInfoStr, "Closing", 98);
   sendATCommand("AT+QICLOSE=" + String(connectID), 3000);
@@ -2712,6 +3785,9 @@ static bool sendPhotoOverTCP(const uint8_t* buffer, size_t length) {
 
 // Phase 2b: full runMainJob
 static void runMainJob(void) {
+  // Flash marker: unambiguous confirmation of which build is running. Bump
+  // FW_VERSION in platformio.ini on every firmware change so this is meaningful.
+  Serial.printf("[FW] build fw v%d (%s %s)\n", (int)FW_VERSION, __DATE__, __TIME__);
   if (isCycleTimeoutExceeded()) {
     Serial.println("SAFETY: runMainJob aborted - global timeout exceeded");
     applyDaytimeSleepFromGeofence();
@@ -2720,7 +3796,11 @@ static void runMainJob(void) {
   }
   readBatteryStatus();
   Serial.println("Starting main job - BC95 modem already initialized.");
+#if BENCH_SKIP_UPLINK
+  Serial.println("[BENCH] SKIP_UPLINK: skipping modem registration / telemetry / OTA");
+#else
   initializeModule();
+#endif
 
 #if HAS_GNSS
   oled_status("GNSS...", "acquire", 0);
@@ -2747,6 +3827,7 @@ static void runMainJob(void) {
   Serial.println("[GNSS] Disabled (HW variant)");
 #endif
 
+#if !BENCH_SKIP_UPLINK
   updateOledSignalFromCSQ();
   int netHour = -1, netMin = -1;
   String rawClock;
@@ -2776,6 +3857,24 @@ static void runMainJob(void) {
       oled_layout_transmit("NO PHOTO");
     }
   }
+
+#if OTA_VIA_SERVER_COMMAND
+  // Server asked us to update (via {"cmd":"ota"} in the telemetry reply). The
+  // telemetry socket is closed by now, so it is safe to open the OTA socket.
+  if (g_otaRequested) {
+    g_otaRequested = false;
+    runOtaUpdate();  // reboots into the new image on success; returns otherwise
+  }
+#endif
+#if OTA_CHECK_ON_COLD_BOOT
+  // Cold-boot OTA runs here (after telemetry) when the modem has a proven TCP path.
+  if (g_otaColdBootPending) {
+    g_otaColdBootPending = false;
+    Serial.println("[OTA] post-job update check");
+    runOtaUpdate();
+  }
+#endif
+#endif  // !BENCH_SKIP_UPLINK
 }
 
 void runMultiImpulseClassification(uint8_t* image_buffer) {
@@ -3054,30 +4153,60 @@ void setup() {
     Serial.println("=== WARM RESET ===");
   }
   Serial.println("Load switches ON (GPIO 13, 14)");
+#if HAS_GNSS && GNSS_POWER_PERMANENT && GNSS_EXTINT_WAKE
+  // Release any deep-sleep latch on the rewired EXTINT line and hold it idle LOW. The actual
+  // wake pulse happens later in gnssWakeFromBackup() when the first DDC read finds the
+  // receiver still in standby.
+  gnssExtintInit();
+#endif
   heap_caps_malloc_extmem_enable(100000);
 
   // Modem + NVS first: night schedule gate runs before camera/OLED so timer/PIR wake
   // outside the daytime window does one long deep sleep until WAKE (PIR disabled there)
   // — no camera warm-up, GNSS, or ML.
-  Serial.printf("Initializing BC95 modem (RX: GPIO%d, TX: GPIO%d)...\n", BC95_RX_PIN, BC95_TX_PIN);
-  bc95_modem.begin(9600, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+  Serial.printf("Initializing BC95 modem (RX: GPIO%d, TX: GPIO%d, baud: %d)...\n",
+                BC95_RX_PIN, BC95_TX_PIN, (int)BC95_BAUD);
   if (resetReason == ESP_RST_POWERON) {
-    if (!waitForModuleBoot(30, 500)) {
+    // Cold boot: open at target baud, auto-detect + migrate if still at fallback.
+    if (!modemBootAndSetBaud(30, 500)) {
       Serial.println("WARNING: NB-IoT module may not be fully booted");
     }
   } else if (wakeupCause == ESP_SLEEP_WAKEUP_TIMER || wakeupCause == ESP_SLEEP_WAKEUP_EXT0 || wakeupCause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Modem stayed powered through PSM, so it keeps its UART baud. Open at the
+    // target; if it doesn't answer, fall back + migrate.
+    bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
     if (usePSM) {
       wakeModuleFromPSM();
     } else {
       delay(500);
     }
+#if BC95_BAUD != BC95_BAUD_FALLBACK
+    if (!modemRespondsAT()) {
+      bc95_modem.begin(BC95_BAUD_FALLBACK, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+      delay(40);
+      if (modemRespondsAT()) raiseModemBaudToTarget();
+      else bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
+    }
+#endif
   } else {
+    bc95_modem.begin(BC95_BAUD, SERIAL_8N1, BC95_RX_PIN, BC95_TX_PIN);
     delay(500);
   }
   Serial.println("BC95 modem serial initialized.");
 
   initializeDeviceIdentity();
   loadSleepGeoFromNvs();
+
+#if OTA_CHECK_ON_COLD_BOOT
+  // True power-on only (not deep-sleep wakes): check for a firmware update before
+  // the night-sleep gate so the device can be updated even outside operating
+  // hours. Reboots into the new image on success; otherwise continues boot.
+  if (resetReason == ESP_RST_POWERON) {
+    Serial.println("[OTA] cold boot -> deferred until after main job");
+    g_otaColdBootPending = true;
+  }
+#endif
+
   tryScheduleNightSleepIfOutsideWindow();
 
   // Step 4: Reset I2C controller state before camera/OLED use.

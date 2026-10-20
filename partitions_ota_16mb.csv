@@ -1,0 +1,11 @@
+# OTA-capable partition table for 16 MB flash (ESP32-S3 N16R8).
+# Two 5 MB app slots (huge_app was a single 3 MB slot) so esp_ota can flip
+# between ota_0/ota_1 over the air. nvs + otadata offsets match huge_app.csv,
+# so the device_id stored in NVS survives the one-time USB reflash to this table.
+# Name,     Type, SubType,  Offset,   Size,    Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x500000,
+app1,       app,  ota_1,    0x510000, 0x500000,
+spiffs,     data, spiffs,   0xA10000, 0x5E0000,
+coredump,   data, coredump, 0xFF0000, 0x10000,

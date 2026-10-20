@@ -8,3 +8,6 @@
 .vscode/ipch
 .DS_Store
 .cursor/
+
+# Syncthing conflict copies
+.sync-conflict-*
